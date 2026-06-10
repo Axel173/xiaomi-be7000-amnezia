@@ -1,0 +1,13 @@
+# Файлы, уезжающие на роутер (busybox sh), — СТРОГО с LF в рабочей копии.
+# CRLF ломает shebang (#!/bin/sh с \r) и `. notify.conf` (source значений с \r).
+# Эти правила гарантируют LF независимо от глобального core.autocrlf на машине,
+# поэтому при редактировании и заливке (WinSCP/base64) скрипты не сломаются.
+*.sh                  text eol=lf
+*.conf                text eol=lf
+notify.conf.example   text eol=lf
+iplist.conf.example   text eol=lf
+awg.conf.example      text eol=lf
+
+# .ps1/.bat намеренно НЕ трогаем: они работают на ПК как есть (UTF-8 BOM
+# важен для PowerShell 5 на ру-Windows), пусть остаются под глобальным
+# core.autocrlf.

@@ -1,0 +1,10 @@
+/.idea/
+/local/
+
+# Секреты/рантайм be7000.ps1 (лежат в корне; в git только *.example-шаблоны).
+awg.conf
+/configs/
+notify.conf
+/backups/
+/diag/
+*.bak
