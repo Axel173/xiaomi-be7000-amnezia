@@ -30,7 +30,7 @@ param(
 )
 
 # Версия PC-стороны проекта. Бампать при заметных изменениях; см. CHANGELOG.md.
-$script:ProjectVersion = '0.1.0'
+$script:ProjectVersion = '0.2.0'
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8

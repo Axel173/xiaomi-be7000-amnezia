@@ -106,9 +106,9 @@ with AmneziaWG (or a ready-made config from one). See [Step 4](#step-4-prepare-t
 - **Don't publish your secrets.** The `awg.conf`, `configs/*.conf` and `notify.conf` files contain
   private keys and passwords. They're already in `.gitignore` — only the `*.example` templates go
   into the repository. Never send anyone your `awg.conf`.
-- **A from-scratch install is not verified end-to-end in this version.** The project is exercised by
-  updating scripts on an already-working router; the clean-install path may have rough edges (manual
-  tweaks possible). If installing from scratch, keep router access handy.
+- **A from-scratch install has been verified once on the author's hardware** (BE7000, firmware 1.1.38).
+  The project is still early (0.x) — other setups may hit rough edges and need manual tweaks. If
+  installing from scratch, keep router access handy.
 - **No warranty, at your own risk.** Much of this is verified only on live hardware.
 
 ---
