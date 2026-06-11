@@ -6,8 +6,8 @@
 # Версия 2.0 / май 2026:
 #   - Чистит пустые I1..I5 в awg.conf перед запуском awg_setup.sh
 #   - Восстанавливает amnezia_for_awg.conf если он пропал
-#   - Защищает пользовательские бинарники: если есть .working.bak —
-#     восстанавливает их, если вендорный awg_setup.sh их перетёр
+#   - (исторически восстанавливал бинарники из .working.bak; .working.bak ретайрнут
+#     июнь 2026 — curl-угроза в awg_setup.sh устранена, восстановление = переустановка с ПК)
 #   - Добавляет FORWARD ACCEPT на awg0 (без этого fw3 дропает LAN-трафик)
 #   - Вызывает split-route.sh если он есть (DRY: правила в одном месте)
 
@@ -56,22 +56,10 @@ if [ -f awg0.conf ] && grep -qE '^I[1-5]\s*=\s*$' awg0.conf; then
     sed -i '/^I[1-5]\s*=\s*$/d' awg0.conf
 fi
 
-# 0.5. Защита пользовательских бинарников.
-# Если вендорный awg_setup.sh когда-то скачал свой amneziawg-go/awg
-# поверх наших (так бывает), восстановим из .working.bak.
-for bin in amneziawg-go awg; do
-    if [ -f "$bin.working.bak" ]; then
-        # Сравниваем размеры — если отличаются, восстанавливаем
-        if [ ! -f "$bin" ] || [ "$(stat -c%s "$bin" 2>/dev/null)" != "$(stat -c%s "$bin.working.bak" 2>/dev/null)" ]; then
-            cp "$bin.working.bak" "$bin"
-            chmod +x "$bin"
-            echo "restored $bin from .working.bak"
-        fi
-    fi
-done
-
 # 1. Поднимаем туннель (вендорный awg_setup.sh, идемпотентный — НЕ перекачивает
-# бинарники если они есть)
+# бинарники если они есть; при их отсутствии честно падает с exit 1).
+# (.working.bak больше не используется: curl-угроза, ради которой он жил, устранена;
+#  восстановление бинарей при пропаже/порче = переустановка с ПК.)
 echo "--- bringing up awg0 ---"
 ip link del awg0 2>/dev/null
 ./awg_setup.sh
@@ -148,6 +136,14 @@ if [ -x ./apply-bypass.sh ]; then
     ./apply-bypass.sh apply
 fi
 
+# 5.6. Активный транспорт. awg уже поднят выше (как туннель/тёплый резерв); если
+# активен Xray — поднимаем его ПОВЕРХ (свап default table 1000 awg0->xtun + DNS).
+# Флаг .transport переживает ребут; нет файла => awg (поведение как раньше).
+if [ "$(cat "$AWG_DIR/.transport" 2>/dev/null)" = "xray" ] && [ -x ./xray-transport.sh ]; then
+    echo "--- transport=xray: bring up xray over awg ---"
+    ./xray-transport.sh up
+fi
+
 # 6. Диагностика
 echo "--- awg0 ---"
 ./awg show awg0 2>&1 | head -20
@@ -178,6 +174,12 @@ if ip link show awg0 >/dev/null 2>&1 && [ -n "$WG" ]; then
     done
 fi
 
+# При xray-транспорте вердикт по здоровью Xray (awg0 может не давать handshake,
+# если awg заблокирован и держится лишь как тёплый резерв). hs>0 трактуется ниже
+# как «VPN жив» -> boot-ok; иначе boot-fail.
+if [ "$(cat "$AWG_DIR/.transport" 2>/dev/null)" = "xray" ] && [ -x "$AWG_DIR/xray-transport.sh" ]; then
+    if "$AWG_DIR/xray-transport.sh" health >/dev/null 2>&1; then hs=$(date +%s); else hs=0; fi
+fi
 active=$(cat "$AWG_DIR/.active" 2>/dev/null)
 if [ -x "$NOTIFY_EVENT" ]; then
     if [ "$hs" -gt 0 ]; then

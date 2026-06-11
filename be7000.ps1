@@ -68,11 +68,15 @@ $OPTIONAL_FILES = @(
     "iplist.conf.example",
     "xiaomi-bypass.sh",
     "apply-bypass.sh",
-    "awg-dump.sh"
+    "awg-dump.sh",
+    "xray-transport.sh",
+    "hev.yaml"
 )
 $BIN_FILES = @{
     "amneziawg-go.user" = "bin/amneziawg-go.user"
     "awg.user"          = "bin/awg.user"
+    "xray.user"         = "bin/xray.user"
+    "hev.user"          = "bin/hev.user"
 }
 
 # ============================================================
@@ -289,7 +293,9 @@ function Action-Status {
             "printf 'Уведомления: '; [ -f $AWG_DIR/.notify-off ] && echo 'ВЫКЛ' || echo 'ВКЛ'; " +
             "printf 'Watchdog в cron: '; grep -q awg-watchdog /etc/crontabs/root && echo 'да' || echo 'НЕТ'; " +
             "printf 'Failover (режим): '; cat $AWG_DIR/.failover-mode 2>/dev/null || echo sticky; " +
-            "printf 'Failover home: '; cat $AWG_DIR/.failover-home 2>/dev/null || echo '?'"
+            "printf 'Failover home: '; cat $AWG_DIR/.failover-home 2>/dev/null || echo '?'; " +
+            "printf 'Failover эскалация: '; cat $AWG_DIR/.failover-escalate 2>/dev/null || echo cross; " +
+            "printf 'Домашний транспорт: '; cat $AWG_DIR/.transport-home 2>/dev/null || echo '(не задан)'"
     $w = Invoke-Router -Command $wcmd -Silent
     Write-Host ""
     Write-Host "--- Watchdog / уведомления ---" -ForegroundColor Cyan
@@ -923,6 +929,7 @@ function Action-SwitchCountry {
     $cmd = "if command -v vpn >/dev/null 2>&1; then vpn $country; else sh $AWG_DIR/switch-vpn.sh $country; fi"
     $out = Invoke-Router -Command $cmd
     Write-Host ($out -join "`n")
+    $script:RouterSummary = Get-RouterSummary   # обновить «Протокол · Конфиг» в шапке
 }
 
 function Action-UploadConfig {
@@ -1014,6 +1021,260 @@ function Action-UploadConfig {
     }
 }
 
+# ============================================================
+# Xray-транспорт и управление xray-конфигами (Фаза 1)
+# «Сменить протокол» = xray-transport.sh up/down (свап default в table 1000
+# awg0<->xtun; общие правила маркировки НЕ трогаются). Конфиги xray лежат в
+# $AWG_DIR/xray-configs/<name>.json (секрет), активный копируется в xray.json.
+# JSON генерим/правим ЗДЕСЬ — на роутере нет jq.
+# ============================================================
+function Get-Transport {
+    $t = ("" + (Invoke-Router -Command "cat $AWG_DIR/.transport 2>/dev/null" -Silent)).Trim()
+    if (-not $t) { $t = "awg" }
+    return $t
+}
+function Get-XrayConfigNames {
+    $raw = Invoke-Router -Command "ls -1 $AWG_DIR/xray-configs/ 2>/dev/null | grep '\.json$' | sed 's/\.json$//'" -Silent
+    if (-not $raw) { return @() }
+    return @((("" + ($raw -join "`n")) -split "`r?`n") | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object { $_.Trim() })
+}
+function Get-ActiveXrayName { return ("" + (Invoke-Router -Command "cat $AWG_DIR/.xray-active 2>/dev/null" -Silent)).Trim() }
+
+function Parse-VlessLink {
+    param([string]$link)
+    if ($link -notmatch '^vless://') { return $null }
+    $s = $link.Substring(8)
+    $remark = ""
+    if ($s.Contains('#')) { $k = $s.IndexOf('#'); $remark = [uri]::UnescapeDataString($s.Substring($k + 1)); $s = $s.Substring(0, $k) }
+    $query = ""
+    if ($s.Contains('?')) { $k = $s.IndexOf('?'); $query = $s.Substring($k + 1); $s = $s.Substring(0, $k) }
+    if ($s -notmatch '^([^@]+)@(.+):(\d+)$') { return $null }
+    $p = @{ uuid = $Matches[1]; host = $Matches[2]; port = $Matches[3]; remark = $remark }
+    foreach ($kv in ($query -split '&')) {
+        if (-not $kv) { continue }
+        $eq = $kv.IndexOf('='); if ($eq -lt 0) { continue }
+        $key = $kv.Substring(0, $eq); $val = [uri]::UnescapeDataString($kv.Substring($eq + 1))
+        switch ($key) {
+            'type'        { $p.type = $val }
+            'security'    { $p.security = $val }
+            'encryption'  { $p.encryption = $val }
+            'flow'        { $p.flow = $val }
+            'sni'         { $p.sni = $val }
+            'serverName'  { $p.sni = $val }
+            'fp'          { $p.fp = $val }
+            'pbk'         { $p.pbk = $val }
+            'sid'         { $p.sid = $val }
+            'spx'         { $p.spx = $val }
+            'path'        { $p.path = $val }
+            'host'        { $p.hostHeader = $val }
+            'serviceName' { $p.serviceName = $val }
+            'alpn'        { $p.alpn = $val }
+        }
+    }
+    return $p
+}
+
+function New-XrayConfigJson {
+    param([hashtable]$P)
+    $enc = if ($P.encryption) { $P.encryption } else { 'none' }
+    $user = [ordered]@{ id = $P.uuid; encryption = $enc }
+    if ($P.flow) { $user.flow = $P.flow }
+    $net = if ($P.type) { $P.type } else { 'tcp' }
+    $sec = if ($P.security) { $P.security } else { 'none' }
+    $stream = [ordered]@{ network = $net; security = $sec }
+    if ($sec -eq 'reality') {
+        $stream.realitySettings = [ordered]@{
+            serverName  = $P.sni
+            fingerprint = $(if ($P.fp) { $P.fp } else { 'chrome' })
+            publicKey   = $P.pbk
+            shortId     = $(if ($P.sid) { $P.sid } else { '' })
+            spiderX     = $(if ($P.spx) { $P.spx } else { '' })
+        }
+    } elseif ($sec -eq 'tls' -or $sec -eq 'xtls') {
+        $stream.security = 'tls'
+        $ts = [ordered]@{ serverName = $P.sni; fingerprint = $(if ($P.fp) { $P.fp } else { 'chrome' }) }
+        if ($P.alpn) { $ts.alpn = @($P.alpn -split ',') }
+        $stream.tlsSettings = $ts
+    }
+    if ($net -eq 'ws') {
+        $ws = [ordered]@{ path = $(if ($P.path) { $P.path } else { '/' }) }
+        if ($P.hostHeader) { $ws.headers = @{ Host = $P.hostHeader } }
+        $stream.wsSettings = $ws
+    } elseif ($net -eq 'grpc') {
+        $stream.grpcSettings = [ordered]@{ serviceName = $P.serviceName }
+    }
+    $cfg = [ordered]@{
+        log       = [ordered]@{ access = '/tmp/xray-access.log'; error = '/tmp/xray.log'; loglevel = 'warning' }
+        inbounds  = @( [ordered]@{ tag = 'socks-in'; listen = '127.0.0.1'; port = 10808; protocol = 'socks'; settings = [ordered]@{ udp = $true } } )
+        outbounds = @( [ordered]@{ tag = 'proxy'; protocol = 'vless'; settings = [ordered]@{ vnext = @( [ordered]@{ address = $P.host; port = [int]$P.port; users = @($user) } ) }; streamSettings = $stream } )
+    }
+    return ($cfg | ConvertTo-Json -Depth 12)
+}
+
+# Мгновенная health-проба egress через локальный socks Xray (пусто = сервер/конфиг
+# не отвечает). Нужна для фидбэка при РУЧНОЙ смене xray-конфига/транспорта: иначе
+# юзер видит «подключился», но зарубежные сайты молчат, и непонятно почему —
+# watchdog вернёт рабочий лишь через ~2-4 мин (анти-дребезг). Лучше сказать сразу.
+function Show-XrayEgressVerdict {
+    param([string]$name)
+    Write-Host "Проверяю egress через xray..." -ForegroundColor DarkGray
+    $ip = ("" + (Invoke-Router -Command "curl -s --max-time 8 --socks5-hostname 127.0.0.1:10808 https://api.ipify.org 2>/dev/null" -Silent)).Trim()
+    if ($ip) {
+        Write-Ok "Xray '$name' работает — выходной IP: $ip"
+    } else {
+        Write-Warn "Xray '$name' подключился, но egress ПУСТ — сервер/конфиг не отвечает (SNI/порт/ключи?)."
+        Write-Host "  Авто-failover вернёт рабочий xray-резерв через ~2-4 мин (анти-дребезг)," -ForegroundColor Yellow
+        Write-Host "  либо выбери другой xray-конфиг сейчас (Протокол -> Выбрать активный xray-конфиг)." -ForegroundColor Yellow
+    }
+}
+
+function Set-ActiveXrayConfig {
+    param([string]$name)
+    $cmd = "cp $AWG_DIR/xray-configs/$name.json $AWG_DIR/xray.json && chmod 600 $AWG_DIR/xray.json && echo $name > $AWG_DIR/.xray-active && echo OK"
+    $out = Invoke-Router -Command $cmd
+    if ("$out" -notmatch "OK") { Write-Err "Не удалось активировать $name"; Write-Host ($out -join "`n"); return }
+    Write-Ok "Активный xray-конфиг: $name"
+    if ((Get-Transport) -eq "xray") {
+        Write-Host "Транспорт=xray — перезапускаю с новым конфигом..." -ForegroundColor DarkGray
+        Write-Host ((Invoke-Router -Command "sh $AWG_DIR/xray-transport.sh down; sh $AWG_DIR/xray-transport.sh up") -join "`n")
+        Show-XrayEgressVerdict $name
+    }
+    $script:RouterSummary = Get-RouterSummary   # обновить «Протокол · Конфиг» в шапке
+}
+
+function Action-SwitchTransport {
+    Write-Section "Транспорт: AmneziaWG <-> Xray"
+    $t = Get-Transport
+    Write-Host "Текущий транспорт: $t"
+    if ($t -eq "xray") {
+        if (-not (_Confirm "Вернуться на AmneziaWG?")) { Write-Warn "Отмена"; return }
+        Write-Host ((Invoke-Router -Command "sh $AWG_DIR/xray-transport.sh down") -join "`n")
+        # Ручной выбор = «домашний» транспорт (для авто-возврата в режиме home).
+        # Авто-cross в watchdog .transport-home НЕ трогает — «дом» только ручной.
+        Invoke-Router -Command "echo awg > $AWG_DIR/.transport-home" -Silent | Out-Null
+    } else {
+        if ((Get-XrayConfigNames).Count -eq 0) { Write-Warn "Нет xray-конфигов — добавь сначала (vless:// или JSON)."; return }
+        if (-not (Get-ActiveXrayName)) { Write-Warn "Не выбран активный xray-конфиг (см. «Выбрать активный xray-конфиг»)."; return }
+        Write-Host "Весь дом -> Xray (заблок-трафик пойдёт через xray)." -ForegroundColor Yellow
+        if (-not (_Confirm "Включить Xray-транспорт?")) { Write-Warn "Отмена"; return }
+        Write-Host ((Invoke-Router -Command "sh $AWG_DIR/xray-transport.sh up") -join "`n")
+        Invoke-Router -Command "echo xray > $AWG_DIR/.transport-home" -Silent | Out-Null
+        Show-XrayEgressVerdict (Get-ActiveXrayName)
+    }
+    $script:RouterSummary = Get-RouterSummary   # обновить «Протокол · Конфиг» в шапке
+}
+
+function Action-AddXrayConfig {
+    Write-Section "Добавить xray-конфиг (vless:// или JSON)"
+    Write-Host "Вставь vless://... одной строкой, либо путь к .json с xray-конфигом." -ForegroundColor DarkGray
+    $raw = Read-Host "vless:// или путь к .json"
+    if (-not $raw) { Write-Warn "Отмена"; return }
+    $raw = $raw.Trim().Trim('"')
+    $json = $null; $defName = "xray"
+    if ($raw -match '^vless://') {
+        $p = Parse-VlessLink $raw
+        if (-not $p) { Write-Err "Не разобрал vless://"; return }
+        if ($p.security -eq 'reality' -and -not $p.pbk) { Write-Warn "В ссылке нет pbk (Reality publicKey) — проверь" }
+        $json = New-XrayConfigJson $p
+        if ($p.remark) { $defName = $p.remark }
+    } elseif (Test-Path -LiteralPath $raw -PathType Leaf) {
+        try { $json = [System.IO.File]::ReadAllText($raw, [System.Text.Encoding]::UTF8); $null = $json | ConvertFrom-Json }
+        catch { Write-Err "Файл не парсится как JSON"; return }
+        $defName = [System.IO.Path]::GetFileNameWithoutExtension($raw)
+    } else {
+        try { $null = $raw | ConvertFrom-Json; $json = $raw } catch { Write-Err "Не vless:// и не JSON"; return }
+    }
+    $defName = ($defName -replace '[^A-Za-z0-9._-]', '-'); if (-not $defName) { $defName = "xray" }
+    $inName = Read-Host "Имя конфига (Enter = '$defName')"
+    $name = if ($inName) { $inName.Trim() } else { $defName }
+    if ($name -notmatch '^[A-Za-z0-9._-]+$') { Write-Err "Имя: латиница/цифры/._-"; return }
+    Invoke-Router -Command "mkdir -p $AWG_DIR/xray-configs" -Silent | Out-Null
+    if (-not (Send-RouterFileAtomic "$AWG_DIR/xray-configs/$name.json" $json 600)) { Write-Err "Не залил конфиг"; return }
+    Write-Ok "xray-конфиг '$name' сохранён"
+    if (_Confirm "Сделать '$name' активным сейчас?") { Set-ActiveXrayConfig $name }
+    else { Write-Host "Активировать позже: «Выбрать активный xray-конфиг»." -ForegroundColor DarkGray }
+}
+
+function Action-SwitchXrayConfig {
+    Write-Section "Выбрать активный xray-конфиг"
+    $names = Get-XrayConfigNames
+    if ($names.Count -eq 0) { Write-Warn "Нет xray-конфигов."; return }
+    $active = Get-ActiveXrayName
+    $i = 1; $map = @{}
+    foreach ($n in $names) { $mk = if ($n -eq $active) { "  <- активный" } else { "" }; Write-Host "  $i) $n$mk"; $map["$i"] = $n; $i++ }
+    Write-Host "  0) Отмена"
+    $sel = Read-Host "Номер"
+    if ($sel -eq "0" -or -not $map.ContainsKey($sel)) { Write-Warn "Отмена"; return }
+    Set-ActiveXrayConfig $map[$sel]
+}
+
+function Action-EditXrayReality {
+    Write-Section "Правка SNI / fingerprint xray-конфига"
+    $names = Get-XrayConfigNames
+    if ($names.Count -eq 0) { Write-Warn "Нет xray-конфигов."; return }
+    $active = Get-ActiveXrayName
+    $i = 1; $map = @{}
+    foreach ($n in $names) { $mk = if ($n -eq $active) { "  <- активный" } else { "" }; Write-Host "  $i) $n$mk"; $map["$i"] = $n; $i++ }
+    Write-Host "  0) Отмена"
+    $sel = Read-Host "Какой конфиг править"
+    if ($sel -eq "0" -or -not $map.ContainsKey($sel)) { Write-Warn "Отмена"; return }
+    $name = $map[$sel]
+    $txt = "" + (Invoke-Router -Command "cat $AWG_DIR/xray-configs/$name.json 2>/dev/null" -Silent)
+    if (-not $txt.Trim()) { Write-Err "Не прочитал конфиг"; return }
+    try { $obj = $txt | ConvertFrom-Json } catch { Write-Err "Конфиг не парсится"; return }
+    $ss = $obj.outbounds[0].streamSettings
+    $rs = $null
+    if ($ss.PSObject.Properties.Name -contains 'realitySettings') { $rs = $ss.realitySettings }
+    elseif ($ss.PSObject.Properties.Name -contains 'tlsSettings') { $rs = $ss.tlsSettings }
+    if (-not $rs) { Write-Err "В конфиге нет reality/tls settings"; return }
+    Write-Host ("Сейчас: SNI=" + $rs.serverName + "  fp=" + $rs.fingerprint)
+    Write-Warn "fingerprint меняется свободно (uTLS, клиент). SNI поможет ТОЛЬКО если сервер разрешает несколько serverNames — иначе оборвёт хэндшейк!"
+    $newFp = Read-Host "Новый fingerprint (chrome/firefox/safari/ios/edge/random; Enter=без изм)"
+    $newSni = Read-Host "Новый SNI/serverName (Enter=без изм)"
+    if ($newFp) { $rs.fingerprint = $newFp.Trim() }
+    if ($newSni) { $rs.serverName = $newSni.Trim() }
+    $newJson = $obj | ConvertTo-Json -Depth 12
+    if (-not (Send-RouterFileAtomic "$AWG_DIR/xray-configs/$name.json" $newJson 600)) { Write-Err "Не сохранил"; return }
+    Write-Ok "Сохранено"
+    if ($name -eq $active) { Set-ActiveXrayConfig $name }
+}
+
+function Action-DeleteXrayConfig {
+    Write-Section "Удалить xray-конфиг"
+    $names = Get-XrayConfigNames
+    if ($names.Count -eq 0) { Write-Warn "Нет xray-конфигов."; return }
+    $active = Get-ActiveXrayName
+    $i = 1; $map = @{}
+    foreach ($n in $names) { $mk = if ($n -eq $active) { "  <- активный" } else { "" }; Write-Host "  $i) $n$mk"; $map["$i"] = $n; $i++ }
+    Write-Host "  0) Отмена"
+    $sel = Read-Host "Какой удалить"
+    if ($sel -eq "0" -or -not $map.ContainsKey($sel)) { Write-Warn "Отмена"; return }
+    $name = $map[$sel]
+    if ($name -eq $active -and (Get-Transport) -eq "xray") { Write-Err "Активный конфиг при транспорте xray — сначала переключись на awg."; return }
+    if (-not (_Confirm "Удалить xray-конфиг '$name'?")) { Write-Warn "Отмена"; return }
+    Invoke-Router -Command "rm -f $AWG_DIR/xray-configs/$name.json" -Silent | Out-Null
+    if ($name -eq $active) { Invoke-Router -Command "rm -f $AWG_DIR/.xray-active" -Silent | Out-Null }
+    Write-Ok "Удалён: $name"
+}
+
+function Action-DeleteAwgConfig {
+    Write-Section "Удалить конфиг страны (awg)"
+    $raw = Invoke-Router -Command "ls -1 $AWG_DIR/configs/ 2>/dev/null | grep '\.conf$' | sed 's/\.conf$//'" -Silent
+    $names = @((("" + ($raw -join "`n")) -split "`r?`n") | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object { $_.Trim() })
+    if ($names.Count -eq 0) { Write-Warn "Папка configs/ пуста."; return }
+    $active = ("" + (Invoke-Router -Command "cat $AWG_DIR/.active 2>/dev/null" -Silent)).Trim()
+    $i = 1; $map = @{}
+    foreach ($n in $names) { $mk = if ($n -eq $active) { "  <- активный" } else { "" }; Write-Host "  $i) $n$mk"; $map["$i"] = $n; $i++ }
+    Write-Host "  0) Отмена"
+    $sel = Read-Host "Какой удалить"
+    if ($sel -eq "0" -or -not $map.ContainsKey($sel)) { Write-Warn "Отмена"; return }
+    $name = $map[$sel]
+    if ($name -eq $active) { Write-Err "Нельзя удалить активный конфиг ($name) — сначала переключись на другой."; return }
+    if (-not (_Confirm "Удалить awg-конфиг '$name'?")) { Write-Warn "Отмена"; return }
+    Invoke-Router -Command "rm -f $AWG_DIR/configs/$name.conf" -Silent | Out-Null
+    Write-Ok "Удалён: configs/$name.conf"
+}
+
 function Action-DomainList {
     Write-Section "Домены, идущие через AWG (domain.sh list)"
     $cmd = "if command -v domain >/dev/null 2>&1; then domain list; else sh $AWG_DIR/domain.sh list; fi"
@@ -1051,45 +1312,135 @@ function Action-DomainSearch {
 }
 
 # ------------------------------------------------------------
-# iplist.conf — сборка содержимого + запись (общее для «Источник списка IP» и установки)
+# iplist.conf — модель «прочитать -> изменить ключ -> записать» + кастомный файл
 # ------------------------------------------------------------
-# Формат строго LF, без $/кавычек/бэктиков в значениях: файл сорсится busybox
-# ('. iplist.conf') в iplist-update.sh, иначе значения разъедутся. Запись —
-# base64 -> stdin plink -> 'base64 -d', через .new + атомарный mv (прерванная
-# заливка не затрёт рабочий файл). Тот же приём, что в пункте 22.
-function Build-IplistSitesConf {
-    param([string]$Raw, [string]$Origin)
+# Источник CIDR-списка (ipset iplist_set) описывает $AWG_DIR/iplist.conf, его
+# читает iplist-update.sh ('. iplist.conf' busybox'ом). Поэтому строго LF и без
+# $/кавычек/бэктиков в значениях. Пишем через base64 -> stdin plink -> 'base64 -d',
+# .new + атомарный mv (прерванная заливка не затрёт рабочий файл).
+#
+# ДВЕ ОРТОГОНАЛЬНЫЕ оси настройки (потому conf не пересобираем с нуля, а
+# читаем -> меняем нужный ключ -> пишем — смена одной оси не сбрасывает другую):
+#   1) источник СКАЧИВАНИЯ: дефолт opencck cidr4 / IPLIST_SITES / IPLIST_URL;
+#   2) кастомный ЛОКАЛЬНЫЙ файл (IPLIST_CUSTOM_MODE): off / only / merge.
+function Send-RouterFileAtomic {
+    # Атомарно записать текст в файл на роутере: нормализуем CRLF->LF, base64 ->
+    # stdin plink -> 'base64 -d' -> .new + mv + chmod. Возвращает $true/$false.
+    param([string]$RemotePath, [string]$Content, [int]$Mode = 600)
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Content -replace "`r`n", "`n")))
+    $cmd = "base64 -d > '$RemotePath.new' && mv '$RemotePath.new' '$RemotePath' && chmod $Mode '$RemotePath' && echo SAVED `$(wc -c < '$RemotePath') || { rm -f '$RemotePath.new'; echo FAILED; }"
+    $out = Invoke-Router -Command $cmd -StdinData $b64
+    if ("$out" -notmatch "SAVED") { Write-Host ($out -join "`n"); return $false }
+    return $true
+}
+function Write-IplistConf {
+    param([string]$Content)
+    if (-not (Send-RouterFileAtomic "$AWG_DIR/iplist.conf" $Content)) { Write-Err "Не удалось записать iplist.conf"; return $false }
+    Write-Ok "iplist.conf сохранён"
+    return $true
+}
+function Get-IplistConf {
+    # Прочитать текущий iplist.conf с роутера в hashtable IPLIST_* (без обрамляющих
+    # кавычек). Нет файла -> пустой hash (дефолт).
+    $h = @{}
+    $raw = Invoke-Router -Command "cat '$AWG_DIR/iplist.conf' 2>/dev/null" -Silent
+    if (-not $raw) { return $h }
+    foreach ($ln in (("" + ($raw -join "`n")) -split "`n")) {
+        if ($ln -match '^\s*#') { continue }
+        if ($ln -match '^\s*(IPLIST_[A-Z_]+)\s*=\s*(.*)$') {
+            $k = $Matches[1]; $v = $Matches[2].Trim()
+            if ($v -match '^"(.*)"$') { $v = $Matches[1] } elseif ($v -match "^'(.*)'$") { $v = $Matches[1] }
+            $h[$k] = $v
+        }
+    }
+    return $h
+}
+function Format-IplistConf {
+    param([hashtable]$H, [string]$Origin = "be7000")
+    $out = "# iplist.conf — источник списка IP для iplist-update.sh (через be7000: $Origin)`n" +
+           "# Сорсится busybox: строго LF, без спецсимволов в значениях. Правка — через be7000.`n"
+    foreach ($k in @('IPLIST_URL','IPLIST_SITES','IPLIST_BASE','IPLIST_MIN_LINES','IPLIST_CUSTOM_MODE','IPLIST_CUSTOM_FILE')) {
+        if ($H.ContainsKey($k) -and ("" + $H[$k]) -ne "") { $out += ('{0}="{1}"' -f $k, $H[$k]) + "`n" }
+    }
+    return $out
+}
+function Set-IplistConf {
+    # Прочитать conf -> применить Set (хеш ключ=значение) и Remove (список ключей) -> записать.
+    param([hashtable]$Set = @{}, [string[]]$Remove = @(), [string]$Origin = "меню")
+    $h = Get-IplistConf
+    foreach ($k in $Remove) { if ($h.ContainsKey($k)) { $h.Remove($k) | Out-Null } }
+    foreach ($k in $Set.Keys) { $h[$k] = $Set[$k] }
+    return (Write-IplistConf (Format-IplistConf $h $Origin))
+}
+# Валидаторы значений источника скачивания (зовутся из меню и установки).
+function Get-ValidatedSites {
+    param([string]$Raw)
     $sites = @($Raw -split '[,\s]+' | Where-Object { $_ -ne "" })
-    if ($sites.Count -eq 0) { Write-Warn "Пусто, отмена"; return $null }
+    if ($sites.Count -eq 0) { Write-Warn "Пусто"; return $null }
     $bad = @($sites | Where-Object { $_ -notmatch '^[A-Za-z0-9.\-]+$' })
     if ($bad.Count -gt 0) { Write-Err "Недопустимые имена: $($bad -join ', ')"; return $null }
-    $joined = ($sites -join ' ')
-    Write-Ok "Будет: IPLIST_SITES=`"$joined`""
-    # Порог снижаем: узкий список легитимно может дать мало строк, иначе
-    # сработает анти-«страница-ошибки» (деф. 10) и обновление отклонится.
-    return "# iplist.conf — создан через be7000 ($Origin)`n" +
-           "IPLIST_SITES=`"$joined`"`n" +
-           "IPLIST_MIN_LINES=3`n"
+    return ($sites -join ' ')
 }
-function Build-IplistUrlConf {
-    param([string]$Raw, [string]$Origin)
+function Get-ValidatedUrl {
+    param([string]$Raw)
     $u = $Raw.Trim()
     if ($u -notmatch '^https?://') { Write-Err "URL должен начинаться с http:// или https://"; return $null }
     # Запрещаем символы, ломающие значение в двойных кавычках при source.
     if ($u -match '["`$\\]') { Write-Err "URL содержит запрещённый символ (кавычка/бэктик/доллар/обратный слеш)"; return $null }
-    Write-Ok "Будет: IPLIST_URL=`"$u`""
-    return "# iplist.conf — создан через be7000 ($Origin)`n" +
-           "IPLIST_URL=`"$u`"`n"
+    return $u
 }
-function Write-IplistConf {
-    param([string]$Content)
-    $conf = "$AWG_DIR/iplist.conf"
-    $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($Content -replace "`r`n", "`n")))
-    $cmd = "base64 -d > '$conf.new' && mv '$conf.new' '$conf' && echo SAVED `$(wc -c < '$conf') || { rm -f '$conf.new'; echo FAILED; }"
-    $out = Invoke-Router -Command $cmd -StdinData $b64
-    if ("$out" -notmatch "SAVED") { Write-Err "Не удалось записать iplist.conf"; Write-Host ($out -join "`n"); return $false }
-    Write-Ok "iplist.conf сохранён"
+function Upload-CustomIplist {
+    # Прочитать локальный .txt со списком CIDR/IPv4, провалидировать и атомарно
+    # залить в $AWG_DIR/iplist.custom. Ввод — ПУТЬ (можно перетащить файл в окно
+    # консоли: drag-drop вставит путь, часто в кавычках). Возвращает $true при успехе.
+    Write-Host "Перетащи .txt в окно консоли или укажи путь к файлу со списком IP/подсетей." -ForegroundColor DarkGray
+    Write-Host "Формат: одна CIDR/IPv4 в строке (напр. 104.16.0.0/12 или 8.8.8.8). # — комментарии, пустые строки ок." -ForegroundColor DarkGray
+    $path = Read-Host "Путь к .txt"
+    if (-not $path) { Write-Warn "Пусто, отмена"; return $false }
+    $path = $path.Trim().Trim('"').Trim("'")
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Write-Err "Файл не найден: $path"; return $false }
+
+    # Читаем ЯВНО UTF-8 (грабля CP1251 на ру-Windows для файлов без BOM).
+    try { $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) }
+    catch { Write-Err "Не прочитать файл: $($_.Exception.Message)"; return $false }
+
+    # txt-only в этом заходе: похожее на JSON отбиваем сразу.
+    if ($text.TrimStart() -match '^[\{\[]') { Write-Err "Похоже на JSON. Нужен простой текст: одна CIDR/IP в строке. (Другие форматы — позже.)"; return $false }
+
+    # IPv4 ± маска, с проверкой диапазонов октетов (0-255) и маски (0-32).
+    $reIp = '^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(/(3[0-2]|[12]?\d))?$'
+    $valid = New-Object System.Collections.Generic.List[string]
+    $bad   = New-Object System.Collections.Generic.List[string]
+    foreach ($ln in ($text -split "`r?`n")) {
+        $t = ($ln -replace '#.*$', '').Trim()   # срезать inline-комментарий и пробелы
+        if ($t -eq "") { continue }              # пустые/чистые комментарии — молча мимо
+        if ($t -match $reIp) { $valid.Add($t) | Out-Null } else { $bad.Add($ln.Trim()) | Out-Null }
+    }
+
+    if ($valid.Count -eq 0) {
+        Write-Err "В файле нет валидных CIDR/IPv4 — отмена (ничего не залито)."
+        if ($bad.Count -gt 0) { Write-Host ("Примеры непонятных строк: " + (($bad | Select-Object -First 5) -join ' | ')) -ForegroundColor DarkGray }
+        return $false
+    }
+    if ($bad.Count -gt 0) { Write-Warn "Отброшено невалидных строк: $($bad.Count) (примеры: $(($bad | Select-Object -First 5) -join ' | '))" }
+    # Бюджет /data тесный (~4 МБ) — гард на размер списка.
+    if ($valid.Count -gt 50000) { Write-Err "Слишком большой список: $($valid.Count) строк (лимит 50000 — /data на роутере мал)."; return $false }
+    Write-Ok "Валидных подсетей/IP: $($valid.Count)"
+
+    $content = "# iplist.custom — кастомный список IP/подсетей (залит через be7000)`n" +
+               "# Одна CIDR/IPv4 в строке. Читается iplist-update.sh (режим only/merge).`n" +
+               (($valid -join "`n")) + "`n"
+    Write-Host "Заливаю $AWG_DIR/iplist.custom ..." -ForegroundColor DarkGray
+    if (-not (Send-RouterFileAtomic "$AWG_DIR/iplist.custom" $content)) { Write-Err "Не удалось залить кастомный список"; return $false }
+    Write-Ok "Кастомный список залит: $($valid.Count) записей -> $AWG_DIR/iplist.custom"
     return $true
+}
+function Run-IplistUpdateNow {
+    Write-Host "Запускаю iplist-update.sh (атомарный swap — текущая маршрутизация не прервётся) ..." -ForegroundColor DarkGray
+    $upd = "sh $AWG_DIR/iplist-update.sh; echo '--- результат ---'; " +
+           "ipset list iplist_set 2>/dev/null | grep -E '^(Name|Number of entries):'; " +
+           "tail -n 5 /tmp/iplist-update.log 2>/dev/null"
+    Write-Host ((Invoke-Router -Command $upd) -join "`n")
 }
 # Источник iplist на этапе УСТАНОВКИ: дефолт — весь cidr4 (файл не создаём,
 # iplist-update.sh берёт дефолт), но сразу даём сузить, чтоб не лезть потом в «Источник списка IP».
@@ -1097,103 +1448,153 @@ function Prompt-IplistSourceAtInstall {
     Write-Section "Источник списка IP (iplist) для раздельного туннеля"
     Write-Host "Какие подсети гнать в VPN по CIDR-списку (помимо твоих доменов)?"
     Write-Host "  1) Дефолт: весь cidr4 с opencck (~3000+ подсетей: CF/Google/OpenAI/Discord/Meta)" -ForegroundColor Green
-    Write-Host "  2) Только конкретные сайты (напр. discord.com youtube.com) — IPLIST_SITES"
-    Write-Host "  3) Свой URL целиком — IPLIST_URL"
+    Write-Host "  2) Только конкретные сайты (напр. discord.com youtube.com) — opencck"
+    Write-Host "  3) Свой URL целиком — любой источник, отдающий CIDR/IP построчно"
+    Write-Host "  4) Кастомный локальный .txt список (свой файл) — only/merge"
     Write-Host "  (поменять потом: «Сайты, домены и списки IP» -> Источник списка IP. Сайты: https://iplist.opencck.org)" -ForegroundColor DarkGray
     $sel = Read-Host "Выбор [1]"
     if (-not $sel) { $sel = "1" }
-    $content = $null
     switch ($sel) {
         "2" {
             $raw = Read-Host "Сайты (через пробел/запятую)"
-            if ($raw) { $content = Build-IplistSitesConf $raw "установка" }
-            else { Write-Warn "Пусто -> оставляю дефолт" }
+            $sites = if ($raw) { Get-ValidatedSites $raw } else { $null }
+            # порог снижаем: узкий список легитимно даёт мало строк (иначе анти-«страница-ошибки» отклонит).
+            if ($sites) { Set-IplistConf -Set @{ IPLIST_SITES = $sites; IPLIST_MIN_LINES = '3' } -Origin "установка: сайты" | Out-Null }
+            else { Write-Warn "-> оставляю дефолт" }
         }
         "3" {
-            $u = Read-Host "URL (должен отдавать CIDR построчно, format=text)"
-            if ($u) { $content = Build-IplistUrlConf $u "установка" }
-            else { Write-Warn "Пусто -> оставляю дефолт" }
+            $u = Read-Host "URL (отдаёт CIDR/IP построчно, напр. format=text)"
+            $url = if ($u) { Get-ValidatedUrl $u } else { $null }
+            if ($url) { Set-IplistConf -Set @{ IPLIST_URL = $url } -Origin "установка: URL" | Out-Null; Write-Ok "Источник: $url" }
+            else { Write-Warn "-> оставляю дефолт" }
+        }
+        "4" {
+            if (Upload-CustomIplist) {
+                Write-Host "  o) only  — ТОЛЬКО локальный файл, без интернета"
+                Write-Host "  m) merge — opencck + локальный файл сверху [по умолчанию]"
+                $m = Read-Host "Режим [m]"
+                $mode = if ($m -eq 'o') { 'only' } else { 'merge' }
+                Set-IplistConf -Set @{ IPLIST_CUSTOM_MODE = $mode } -Origin "установка: custom $mode" | Out-Null
+                Write-Ok "Кастомный список включён ($mode)"
+            } else { Write-Warn "-> оставляю дефолт (весь cidr4 с opencck)" }
         }
         default { Write-Info "Оставляю дефолт (весь cidr4 с opencck)." }
     }
-    if ($content) { Write-IplistConf $content | Out-Null }
 }
 
 function Action-IplistSource {
-    # Управление источником CIDR-списка (ipset iplist_set) — аналог блока ДОМЕНЫ,
-    # но для CIDR от opencck. Источник хранит $AWG_DIR/iplist.conf, его читает
-    # iplist-update.sh. Файл ОПЦИОНАЛЕН: нет файла / нет IPLIST_* -> дефолт
-    # (весь cidr4 с opencck). Пишем тем же безопасным способом, что и заливка конфига
-    # (base64 -> stdin plink -> 'base64 -d', .new + атомарный mv): iplist.conf
-    # сорсится busybox ('. iplist.conf'), поэтому строго LF и без $/кавычек/
-    # бэктиков в значениях — иначе значения разъедутся при source.
+    # Управление источником CIDR-списка (ipset iplist_set). ДВЕ ОРТОГОНАЛЬНЫЕ оси:
+    #   - источник СКАЧИВАНИЯ (opencck по умолчанию / сайты / свой URL);
+    #   - кастомный ЛОКАЛЬНЫЙ файл (off / only / merge).
+    # Conf читается-меняется-пишется по ключам (Set-IplistConf), поэтому смена одной
+    # оси НЕ сбрасывает другую. iplist-update.sh при отсутствии IPLIST_* берёт дефолт
+    # (весь cidr4 с opencck). Меню остаётся открытым для нескольких операций подряд.
     Write-Section "Источник списка IP (iplist)"
 
-    $conf = "$AWG_DIR/iplist.conf"
-    # Текущее состояние (read-only): iplist.conf + счётчик set + хвост лога.
-    $show = "if [ -f '$conf' ]; then echo '--- iplist.conf ---'; cat '$conf'; else echo '(нет iplist.conf -> дефолт: весь cidr4 с opencck)'; fi; echo '--- iplist_set ---'; " +
-            "ipset list iplist_set 2>/dev/null | grep -E '^(Name|Number of entries):'; " +
-            "echo '--- лог (хвост) ---'; tail -n 3 /tmp/iplist-update.log 2>/dev/null"
-    Write-Host ((Invoke-Router -Command $show -Silent) -join "`n") -ForegroundColor Gray
+    # Есть ли уже залитый кастомный файл (для подсказок при включении only/merge).
+    $hasCustom = { ("" + (Invoke-Router -Command "[ -s '$AWG_DIR/iplist.custom' ] && echo yes" -Silent)).Trim() -eq 'yes' }
 
-    Write-Host ""
-    Write-Host "  1) Только конкретные сайты (IPLIST_SITES)"
-    Write-Host "  2) Свой URL целиком (IPLIST_URL)"
-    Write-Host "  3) Сброс к дефолту (весь cidr4 с opencck)"
-    Write-Host "  4) Просто обновить сейчас (iplist-update.sh)"
-    Write-Host "  0) Назад"
-    $sel = Read-Host "Выбор"
+    while ($true) {
+        # Текущее состояние (read-only): значения conf + кастомный файл + счётчик set + хвост лога.
+        $show = "cd '$AWG_DIR' 2>/dev/null; " + @'
+if [ -f iplist.conf ]; then echo '--- iplist.conf (значения) ---'; grep -v '^#' iplist.conf | grep . || echo '(пусто -> дефолт: весь cidr4 с opencck)'; else echo '(нет iplist.conf -> дефолт: весь cidr4 с opencck)'; fi
+printf '--- кастомный файл: '
+if [ -s iplist.custom ]; then cnt=$(grep -c '^[0-9]' iplist.custom 2>/dev/null); echo "${cnt:-0} записей"; else echo '(нет iplist.custom)'; fi
+printf '--- iplist_set: '
+ipset list iplist_set 2>/dev/null | awk '/^Number of entries:/{print $NF" подсетей"}'
+echo '--- лог (хвост) ---'
+tail -n 3 /tmp/iplist-update.log 2>/dev/null
+'@
+        Write-Host ((Invoke-Router -Command $show -Silent) -join "`n") -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "  Источник СКАЧИВАНИЯ (из интернета):" -ForegroundColor Cyan
+        Write-Host "    1) opencck — весь cidr4 (дефолт: CF/Google/OpenAI/Discord/Meta)"
+        Write-Host "    2) Только конкретные сайты на opencck (IPLIST_SITES)"
+        Write-Host "    3) Свой URL целиком — любой источник, отдающий CIDR/IP построчно"
+        Write-Host "  Кастомный ЛОКАЛЬНЫЙ файл:" -ForegroundColor Cyan
+        Write-Host "    4) Залить / обновить локальный .txt список"
+        Write-Host "    5) Режим: off   — не использовать локальный файл"
+        Write-Host "    6) Режим: only  — ТОЛЬКО локальный файл, без интернета"
+        Write-Host "    7) Режим: merge — интернет (1/2/3) + локальный файл сверху"
+        Write-Host "  Прочее:" -ForegroundColor Cyan
+        Write-Host "    8) Обновить список сейчас (iplist-update.sh)"
+        Write-Host "    0) Назад"
+        $sel = Read-Host "Выбор"
 
-    $newContent = $null
-    switch ($sel) {
-        "1" {
-            Write-Host "Сайты через пробел/запятую (напр.: discord.com discord.gg discord.media)." -ForegroundColor DarkGray
-            Write-Host "Доступные сайты: https://iplist.opencck.org" -ForegroundColor DarkGray
-            $raw = Read-Host "Сайты"
-            if (-not $raw) { Write-Warn "Отмена"; return }
-            $newContent = Build-IplistSitesConf $raw "меню be7000"
-            if (-not $newContent) { return }
+        $changed = $false
+        switch ($sel) {
+            "1" {
+                if (Set-IplistConf -Remove @('IPLIST_URL','IPLIST_SITES','IPLIST_MIN_LINES') -Origin "меню: opencck дефолт") {
+                    Write-Ok "Источник скачивания: весь cidr4 с opencck"; $changed = $true
+                }
+            }
+            "2" {
+                Write-Host "Сайты через пробел/запятую (напр.: discord.com discord.gg discord.media). Список: https://iplist.opencck.org" -ForegroundColor DarkGray
+                $raw = Read-Host "Сайты"
+                if ($raw) {
+                    $sites = Get-ValidatedSites $raw
+                    # порог снижаем: узкий список легитимно даёт мало строк (анти-«страница-ошибки» иначе отклонит).
+                    if ($sites -and (Set-IplistConf -Set @{ IPLIST_SITES = $sites; IPLIST_MIN_LINES = '3' } -Remove @('IPLIST_URL') -Origin "меню: сайты")) {
+                        Write-Ok "Источник скачивания: сайты [$sites]"; $changed = $true
+                    }
+                } else { Write-Warn "Пусто, не меняю" }
+            }
+            "3" {
+                Write-Host "Полный URL. Должен отдавать CIDR/IP построчно (как iplist.opencck.org/?format=text)." -ForegroundColor DarkGray
+                $u = Read-Host "URL"
+                if ($u) {
+                    $url = Get-ValidatedUrl $u
+                    if ($url -and (Set-IplistConf -Set @{ IPLIST_URL = $url } -Remove @('IPLIST_SITES') -Origin "меню: свой URL")) {
+                        Write-Ok "Источник скачивания: $url"; $changed = $true
+                    }
+                } else { Write-Warn "Пусто, не меняю" }
+            }
+            "4" {
+                if (Upload-CustomIplist) {
+                    $changed = $true
+                    # Файл залит, но если режим ещё off — он не используется; предложим включить.
+                    $cur = "" + (Get-IplistConf)['IPLIST_CUSTOM_MODE']
+                    if ($cur -ne 'only' -and $cur -ne 'merge') {
+                        Write-Host "Режим кастома сейчас OFF — файл пока не используется." -ForegroundColor Yellow
+                        Write-Host "  o) only  — только этот файл, без интернета"
+                        Write-Host "  m) merge — интернет + этот файл сверху"
+                        Write-Host "  Enter — оставить off"
+                        switch (Read-Host "Включить режим?") {
+                            "o" { if (Set-IplistConf -Set @{ IPLIST_CUSTOM_MODE = 'only' }  -Origin "меню: custom only")  { Write-Ok "Режим кастома: only" } }
+                            "m" { if (Set-IplistConf -Set @{ IPLIST_CUSTOM_MODE = 'merge' } -Origin "меню: custom merge") { Write-Ok "Режим кастома: merge" } }
+                            default { Write-Info "Режим оставлен off" }
+                        }
+                    }
+                }
+            }
+            "5" {
+                # off: убираем ключ режима (файл НЕ удаляем — пусть лежит на будущее).
+                if (Set-IplistConf -Remove @('IPLIST_CUSTOM_MODE') -Origin "меню: custom off") {
+                    Write-Ok "Кастомный файл выключен (off). Сам файл не удалён."; $changed = $true
+                }
+            }
+            "6" {
+                if (-not (& $hasCustom)) { Write-Warn "Локального файла ещё нет — сначала пункт 4 (залить). only без файла оставит set пустым." }
+                if (Set-IplistConf -Set @{ IPLIST_CUSTOM_MODE = 'only' } -Origin "меню: custom only") {
+                    Write-Ok "Режим кастома: only (интернет не используется)"; $changed = $true
+                }
+            }
+            "7" {
+                if (-not (& $hasCustom)) { Write-Warn "Локального файла ещё нет — сначала пункт 4 (залить)." }
+                if (Set-IplistConf -Set @{ IPLIST_CUSTOM_MODE = 'merge' } -Origin "меню: custom merge") {
+                    Write-Ok "Режим кастома: merge (интернет + файл)"; $changed = $true
+                }
+            }
+            "8" { Run-IplistUpdateNow }
+            "0" { return }
+            default { Write-Warn "Неизвестный пункт" }
         }
-        "2" {
-            Write-Host "Полный URL источника. Должен отдавать CIDR построчно (format=text)." -ForegroundColor DarkGray
-            $u = Read-Host "URL"
-            if (-not $u) { Write-Warn "Отмена"; return }
-            $newContent = Build-IplistUrlConf $u "меню be7000"
-            if (-not $newContent) { return }
-        }
-        "3" {
-            if (-not (_Confirm "Вернуться к дефолту (весь cidr4 с opencck)?")) { Write-Warn "Отмена"; return }
-            # Не удаляем файл (rm в удалённой команде может ложно блокироваться
-            # локальным sandbox-guard'ом, и это не нужно): пишем заглушку без
-            # IPLIST_* — iplist-update.sh при отсутствии переменных берёт дефолт.
-            $newContent = "# iplist.conf — сброшен к дефолту через be7000 (меню: Источник списка IP)`n" +
-                          "# Без IPLIST_* -> источник по умолчанию: весь cidr4 с opencck.`n" +
-                          "# Сузить можно снова через меню (Источник списка IP) или из iplist.conf.example.`n"
-        }
-        "4" { }   # ниже просто запустим обновление
-        "0" { return }
-        default { Write-Warn "Неизвестный пункт"; return }
-    }
 
-    # Записать iplist.conf (если выбрана смена источника / сброс). Контент собран
-    # на `n (LF) -> на роутер уходит чистый LF. .new + mv: прерванная запись не
-    # затрёт рабочий iplist.conf.
-    if ($null -ne $newContent) {
-        Write-Host "Записываю $conf ..." -ForegroundColor DarkGray
-        if (-not (Write-IplistConf $newContent)) { return }
-    }
-
-    # Применить сейчас? Для пункта 4 — это и есть выбор; для 1/2/3 — спросим.
-    $runNow = ($sel -eq "4")
-    if (-not $runNow) { $runNow = _Confirm "Обновить список сейчас (iplist-update.sh)?" }
-    if ($runNow) {
-        Write-Host "Запускаю iplist-update.sh (атомарный swap — текущая маршрутизация не прервётся) ..." -ForegroundColor DarkGray
-        $upd = "sh $AWG_DIR/iplist-update.sh; echo '--- результат ---'; " +
-               "ipset list iplist_set 2>/dev/null | grep -E '^(Name|Number of entries):'; " +
-               "tail -n 4 /tmp/iplist-update.log 2>/dev/null"
-        Write-Host ((Invoke-Router -Command $upd) -join "`n")
-    } else {
-        Write-Host "Применится при следующем запуске iplist-update.sh (boot или 5:00), либо: Источник списка IP -> Обновить." -ForegroundColor DarkGray
+        if ($changed) {
+            if (_Confirm "Применить сейчас (iplist-update.sh)?") { Run-IplistUpdateNow }
+            else { Write-Host "Применится при следующем запуске (boot или 5:00), либо пункт 8." -ForegroundColor DarkGray }
+        }
+        Write-Host ""
     }
 }
 
@@ -1287,36 +1688,43 @@ function Action-FailoverToggle {
     # sticky — switch-vpn.sh failover: перебрать configs/*.conf по алфавиту,
     #          встать на первый рабочий и остаться (дефолт; нет файла → sticky).
     # home   — то же + возврат на «основной» (.failover-home), когда тот оживёт.
-    Write-Section "Авто-failover при падении VPS"
+    Write-Section "Авто-failover при падении VPS (AmneziaWG и Xray)"
     $modeFile = "$AWG_DIR/.failover-mode"
     $homeFile = "$AWG_DIR/.failover-home"
+    $escFile  = "$AWG_DIR/.failover-escalate"
 
     # Текущее состояние тянем простыми cat и парсим на стороне PS (без хрупкой
     # shell-логики в одной строке через plink).
-    $out = Invoke-Router -Command "printf 'M:'; cat $modeFile 2>/dev/null; echo; printf 'H:'; cat $homeFile 2>/dev/null; echo; printf 'A:'; cat $AWG_DIR/.active 2>/dev/null; echo" -Silent
-    $mode = "sticky"; $homeCfg = ""; $active = ""
+    $out = Invoke-Router -Command "printf 'M:'; cat $modeFile 2>/dev/null; echo; printf 'H:'; cat $homeFile 2>/dev/null; echo; printf 'A:'; cat $AWG_DIR/.active 2>/dev/null; echo; printf 'E:'; cat $escFile 2>/dev/null; echo" -Silent
+    $mode = "sticky"; $homeCfg = ""; $active = ""; $esc = "cross"
     foreach ($line in @($out)) {
         $t = "$line".Trim()
         if     ($t -match '^M:(.*)$') { $v = $matches[1].Trim(); if ($v) { $mode = $v } }
         elseif ($t -match '^H:(.*)$') { $homeCfg = $matches[1].Trim() }
         elseif ($t -match '^A:(.*)$') { $active = $matches[1].Trim() }
+        elseif ($t -match '^E:(.*)$') { $v = $matches[1].Trim(); if ($v) { $esc = $v } }
     }
     if ($mode -notin @('off','sticky','home')) { $mode = 'sticky' }
+    if ($esc  -notin @('cross','direct'))      { $esc  = 'cross' }
 
-    Write-Host "При смерти активного VPS watchdog сам перебирает configs/*.conf (по"
-    Write-Host "алфавиту) и встаёт на первый рабочий сервер, с письмом на почту."
+    Write-Host "При смерти активного сервера watchdog сам перебирает серверы ТЕКУЩЕГО"
+    Write-Host "протокола (awg: configs/*.conf · xray: xray-configs/*.json) и встаёт на"
+    Write-Host "первый рабочий, с письмом на почту."
     Write-Host ""
     $cur = switch ($mode) {
         'off'   { "ВЫКЛ — при падении просто прямой режим (как раньше)" }
         'home'  { "home — встать на резерв, вернуться на основной ('$homeCfg'), когда оживёт" }
         default { "sticky — встать на резерв и остаться на нём" }
     }
-    Write-Host "Сейчас: $cur"
-    Write-Host "Активный конфиг: $active"
+    $curEsc = if ($esc -eq 'direct') { "direct — прямой режим" } else { "cross — попробовать другой протокол" }
+    Write-Host "Сейчас режим: $cur"
+    Write-Host "При исчерпании серверов протокола: $curEsc"
+    Write-Host "Активный awg-конфиг: $active"
     Write-Host ""
+    Write-Host "  ось 1 — перебор серверов внутри протокола:" -ForegroundColor Cyan
     Write-Host "  1) Выключить (off)"                                       -ForegroundColor Yellow
     Write-Host "  2) sticky — встать на резерв и остаться"                  -ForegroundColor Green
-    Write-Host "  3) home — то же + возврат на основной, когда он оживёт"   -ForegroundColor Green
+    Write-Host "  3) home — то же + возврат на основной сервер И на домашний транспорт, когда оживут" -ForegroundColor Green
     Write-Host "  0) Отмена"
     $sel = (Read-Host "Выбор").Trim()
     $newMode = switch ($sel) { "1" { "off" } "2" { "sticky" } "3" { "home" } default { $null } }
@@ -1344,10 +1752,25 @@ function Action-FailoverToggle {
         $newHome = $map[$hsel]
     }
 
+    # Ось 2 — что делать, когда серверы активного протокола ИСЧЕРПАНЫ (только при
+    # включённом failover). cross — перебрать другой протокол (awg<->xray), затем
+    # прямой режим; direct — сразу прямой режим. Анти-петля встроена в watchdog
+    # (каждый протокол перебирается ≤1 раза за эпизод → терминал всегда safety_off).
+    $newEsc = $esc
+    if ($newMode -ne "off") {
+        Write-Host ""
+        Write-Host "  ось 2 — когда серверы активного протокола закончились:" -ForegroundColor Cyan
+        Write-Host "  1) cross — попробовать ДРУГОЙ протокол (awg<->xray), потом прямой" -ForegroundColor Green
+        Write-Host "  2) direct — сразу прямой режим (без смены протокола)"             -ForegroundColor Yellow
+        Write-Host "  (Enter — оставить: $esc)"
+        $esel = (Read-Host "Выбор").Trim()
+        $newEsc = switch ($esel) { "1" { "cross" } "2" { "direct" } "" { $esc } default { $esc } }
+    }
+
     if ($newMode -eq "home") {
-        $apply = "echo home > $modeFile && echo $newHome > $homeFile && echo OK"
+        $apply = "echo home > $modeFile && echo $newHome > $homeFile && echo $newEsc > $escFile && echo OK"
     } else {
-        $apply = "echo $newMode > $modeFile && echo OK"
+        $apply = "echo $newMode > $modeFile && echo $newEsc > $escFile && echo OK"
     }
     $r = Invoke-Router -Command $apply
     if ("$r" -match "OK") {
@@ -1355,6 +1778,10 @@ function Action-FailoverToggle {
             "off"   { Write-Ok "Авто-failover ВЫКЛЮЧЕН (при падении VPS — прямой режим)" }
             "home"  { Write-Ok "Режим: home (основной = '$newHome')" }
             default { Write-Ok "Режим: sticky (встать на резерв и остаться)" }
+        }
+        if ($newMode -ne "off") {
+            if ($newEsc -eq "direct") { Write-Ok "При исчерпании протокола: direct (прямой режим)" }
+            else                      { Write-Ok "При исчерпании протокола: cross (перебрать другой протокол)" }
         }
     } else { Write-Err "Не получилось"; Write-Host ($r -join "`n") }
 }
@@ -2057,7 +2484,7 @@ echo "UNINSTALL_OK"
         Write-Warn "В $AWG_DIR остались файлы и СЕКРЕТЫ:"
         Write-Host "  - awg.conf / awg0.conf / configs/*.conf  (приватные ключи VPN)"
         Write-Host "  - notify.conf  (логин/пароль SMTP в открытом виде, если настраивал почту)"
-        Write-Host "  - вырезы мимо VPN (.bypass-*), режим failover, снимок iplist"
+        Write-Host "  - вырезы мимо VPN (.bypass-*), режим failover, снимок iplist, кастомный список (iplist.custom)"
         Write-Info "Оставить удобно для переустановки. Но если отдаёшь/продаёшь роутер -- лучше стереть."
         if (_Confirm "Стереть ТАКЖЕ все файлы в $AWG_DIR (полная очистка, переустановка будет с нуля)?") {
             $wipe = Invoke-Router -Command "rm -rf $AWG_DIR && echo WIPE_OK || echo WIPE_FAIL"
@@ -2189,9 +2616,6 @@ ls -la $AWG_DIR/amneziawg-go $AWG_DIR/awg 2>/dev/null || echo '(бинарник
 echo '--- versions ---'
 [ -x $AWG_DIR/amneziawg-go ] && $AWG_DIR/amneziawg-go --version 2>&1 | head -1
 [ -x $AWG_DIR/awg ] && $AWG_DIR/awg --version 2>&1 | head -1
-echo '--- .working.bak (защита от перезаписи вендорным скриптом) ---'
-[ -f $AWG_DIR/amneziawg-go.working.bak ] && echo 'amneziawg-go.working.bak: есть' || echo 'amneziawg-go.working.bak: НЕТ'
-[ -f $AWG_DIR/awg.working.bak ] && echo 'awg.working.bak: есть' || echo 'awg.working.bak: НЕТ'
 "@
     $r = Run-SSH $binCmd
     Write-Host ($r -join "`n")
@@ -2287,15 +2711,23 @@ echo "FW ${rom:-?} ${ch:-?}"
 echo "LOAD $(cut -d' ' -f1 /proc/loadavg 2>/dev/null) $(grep -c ^processor /proc/cpuinfo 2>/dev/null)"
 awk '/^MemTotal:/{t=$2}/^MemFree:/{f=$2}/^MemAvailable:/{a=$2}END{printf "RAM %d %d\n",(a==""?f:a)/1024,t/1024}' /proc/meminfo 2>/dev/null
 df /data 2>/dev/null | tail -1 | awk 'NF>=5{printf "DISK %d %d %s\n",$(NF-2)/1024,$(NF-4)/1024,$(NF-1)}'
+D=/data/usr/app/awg
+echo "TPT $(cat $D/.transport 2>/dev/null || echo awg)"
+echo "ACONF $(cat $D/.active 2>/dev/null)"
+echo "XCONF $(cat $D/.xray-active 2>/dev/null)"
 '@
     $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(($sh -replace "`r`n", "`n")))
     $out = Invoke-Router -Command "echo $b64 | base64 -d | sh" -Silent
     if (-not $out) { return $null }
     $fw = $null; $load = $null; $ram = $null; $disk = $null
+    $tpt = "awg"; $aconf = $null; $xconf = $null
     foreach ($ln in @($out)) {
         $p = (("$ln" -replace "`r", "").Trim()) -split "\s+"
         switch ($p[0]) {
             "FW"   { if ($p.Count -ge 3) { $fw = "$($p[1]) ($($p[2]))" } elseif ($p.Count -ge 2) { $fw = $p[1] } }
+            "TPT"   { if ($p.Count -ge 2 -and $p[1]) { $tpt   = $p[1] } }
+            "ACONF" { if ($p.Count -ge 2 -and $p[1]) { $aconf = $p[1] } }
+            "XCONF" { if ($p.Count -ge 2 -and $p[1]) { $xconf = $p[1] } }
             "LOAD" {
                 if ($p.Count -ge 3) {
                     # load average -> понятный % загрузки ЦП (load/ядра*100). Парсим
@@ -2311,10 +2743,17 @@ df /data 2>/dev/null | tail -1 | awk 'NF>=5{printf "DISK %d %d %s\n",$(NF-2)/102
             "DISK" { if ($p.Count -ge 4) { $disk = "ПЗУ /data $($p[1]) из $($p[2]) МБ своб ($($p[3]))" } }
         }
     }
-    # Две строки в шапке: 1) прошивка + ЦП, 2) ОЗУ + ПЗУ (в одну строку всё длинно).
+    # Строка протокола: какой транспорт несёт трафик + активный конфиг. Обновляется
+    # при смене транспорта/страны/xray-конфига (вызовы Get-RouterSummary после них) —
+    # см. Action-SwitchTransport/SwitchCountry/SwitchXrayConfig. CPU/RAM/прошивка
+    # остаются снимком за сессию (тянуть на каждом экране = лишний SSH-таймаут).
+    if ($tpt -eq "xray") { $proto = "Протокол: Xray  ·  Конфиг: $(if ($xconf) { $xconf } else { '?' })" }
+    else                 { $proto = "Протокол: AmneziaWG  ·  Конфиг: $(if ($aconf) { $aconf } else { '?' })" }
+    # Две строки ресурсов: 1) прошивка + ЦП, 2) ОЗУ + ПЗУ (в одну строку всё длинно).
     $l1 = @(); if ($fw) { $l1 += "Прошивка $fw" }; if ($load) { $l1 += $load }
     $l2 = @(); if ($ram) { $l2 += $ram };          if ($disk) { $l2 += $disk }
     $lines = @()
+    if ($proto) { $lines += $proto }
     if ($l1.Count) { $lines += ($l1 -join "  ·  ") }
     if ($l2.Count) { $lines += ($l2 -join "  ·  ") }
     if (-not $lines.Count) { return $null }
@@ -2460,13 +2899,22 @@ $cats = @(
             @{ Label = "Поиск домена в списках"; Do = { Action-DomainSearch } }
             @{ Label = "Вывести САЙТ (IP/подсеть) мимо VPN"; Color = "Yellow"; Do = { Action-ExcludeDstIP } }
             @{ Label = "Вернуть САЙТ (IP/подсеть) в VPN"; Color = "Green"; Do = { Action-IncludeDstIP } }
-            @{ Label = "Источник списка IP (iplist): сайты / URL / обновить"; Color = "Magenta"; Do = { Action-IplistSource } }
+            @{ Label = "Источник списка IP (iplist): opencck / сайты / URL / кастомный файл"; Color = "Magenta"; Do = { Action-IplistSource } }
         ) } }
-    @{ Title = "Страна и серверы (+ авто-failover)"; Mgmt = $true; Sub = {
-        Invoke-Submenu "Страна и серверы" @(
-            @{ Label = "Сменить страну/конфиг VPN"; Do = { Action-SwitchCountry } }
-            @{ Label = "Залить новый конфиг (.conf) на роутер"; Color = "Green"; Do = { Action-UploadConfig } }
+    @{ Title = "Серверы AmneziaWG: страны + failover"; Mgmt = $true; Sub = {
+        Invoke-Submenu "Серверы AmneziaWG (страны)  ·  xray-серверы — в категории «Протокол»" @(
+            @{ Label = "Сменить страну/конфиг AmneziaWG"; Do = { Action-SwitchCountry } }
+            @{ Label = "Залить новый конфиг AmneziaWG (.conf) на роутер"; Color = "Green"; Do = { Action-UploadConfig } }
+            @{ Label = "Удалить конфиг страны (awg)"; Color = "Red"; Do = { Action-DeleteAwgConfig } }
             @{ Label = "Авто-failover при падении VPS (off/sticky/home)"; Color = "Magenta"; Do = { Action-FailoverToggle } }
+        ) } }
+    @{ Title = "Протокол: AmneziaWG / Xray"; Mgmt = $true; Sub = {
+        Invoke-Submenu "Протокол: AmneziaWG <-> Xray" @(
+            @{ Label = "Переключить транспорт (awg <-> xray)"; Color = "Magenta"; Do = { Action-SwitchTransport } }
+            @{ Label = "Добавить xray-конфиг (vless:// или JSON)"; Color = "Green"; Do = { Action-AddXrayConfig } }
+            @{ Label = "Выбрать активный xray-конфиг"; Do = { Action-SwitchXrayConfig } }
+            @{ Label = "Правка SNI / fingerprint (RKN бьёт по fp=chrome)"; Color = "Yellow"; Do = { Action-EditXrayReality } }
+            @{ Label = "Удалить xray-конфиг"; Color = "Red"; Do = { Action-DeleteXrayConfig } }
         ) } }
     @{ Title = "Wi-Fi и подсети (guest / SSID)"; Mgmt = $true; Sub = {
         Invoke-Submenu "Wi-Fi и подсети" @(

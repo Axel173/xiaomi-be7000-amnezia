@@ -2,6 +2,8 @@
 
 🌐 **English** · 🇷🇺 [Русская версия](README.md)
 
+📣 **Project news:** [Telegram channel](https://t.me/+tfMLMVKG03FhMGYy)
+
 This project turns a **Xiaomi BE7000 router (Chinese version, stock firmware)** into a flexible
 VPN gateway with **split routing**: traffic to the services you choose (by IP and domain lists)
 goes through your own server over [AmneziaWG](https://github.com/amnezia-vpn), while everything
@@ -49,6 +51,10 @@ After installation, your BE7000 will have:
 
 - **Split routing.** The services you pick (by IP/domain lists) go through your server, the rest
   goes directly. No need to push all traffic through a single point.
+- **Two transports to choose from: AmneziaWG and Xray (VLESS/Reality).** A single toggle switches
+  the protocol for the whole home — your shared routing rules (what goes through the VPN) are kept.
+  Handy as a fallback: if AmneziaWG starts getting throttled by DPI, switch to Xray. Xray configs are
+  added by a `vless://` link or ready JSON; SNI and fingerprint can be edited right from the PC.
 - **One control panel on your PC.** The `be7000.bat` file opens a menu: turn the VPN on/off, add a
   domain to the tunnel, route a specific device around the VPN, switch countries, check status,
   and so on. No manual commands on the router.
@@ -100,6 +106,9 @@ with AmneziaWG (or a ready-made config from one). See [Step 4](#step-4-prepare-t
 - **Don't publish your secrets.** The `awg.conf`, `configs/*.conf` and `notify.conf` files contain
   private keys and passwords. They're already in `.gitignore` — only the `*.example` templates go
   into the repository. Never send anyone your `awg.conf`.
+- **A from-scratch install is not verified end-to-end in this version.** The project is exercised by
+  updating scripts on an already-working router; the clean-install path may have rough edges (manual
+  tweaks possible). If installing from scratch, keep router access handy.
 - **No warranty, at your own risk.** Much of this is verified only on live hardware.
 
 ---
@@ -275,7 +284,7 @@ section). Briefly, by section:
 | **Status** | Full status: connection, IP, current exclusions |
 | **VPN: on / off / all traffic** | Turn the whole VPN on/off; send all traffic, or a specific network, **entirely** into the tunnel |
 | **Devices around VPN / back** | Route a specific device (by its LAN IP) around the VPN, and back |
-| **Sites, domains and IP lists** | Add/remove a domain, search; route a site (IP/subnet) around the VPN or back; choose the CIDR-list source |
+| **Sites, domains and IP lists** | Add/remove a domain, search; route a site (IP/subnet) around the VPN or back; choose the CIDR-list source (opencck, **any custom URL**, or **your own file** — only/merge) |
 | **Country and servers** | Switch country/config, upload a new `.conf`, auto-failover to a backup server |
 | **Wi-Fi and subnets** | Network status; route the guest network or a specific SSID around the VPN |
 | **Email notifications** | Set up email alerts when the VPN goes down/recovers |
@@ -332,6 +341,10 @@ section). Briefly, by section:
 - **Routing.** Marked traffic (`fwmark 0x1`) goes into a separate routing table with
   `default dev awg0` (the tunnel). Marking is done by two lists (ipset): domains (fed by dnsmasq) and
   CIDR lists of popular foreign services (Cloudflare, Spotify, Steam, Netflix, etc.).
+- **The CIDR-list source is configurable.** By default it's the full opencck list; you can narrow it
+  to specific sites, point it at **any custom URL** (anything that returns CIDR/IP per line), or use
+  **your own local file**: mode `only` (just your file, no internet) or `merge` (opencck/URL + your
+  file on top). The file lives on the router and survives reboots.
 - **"Around the VPN" exclusions.** A separate `VPN_EXCLUDE` chain (with `-j ACCEPT`), checked first.
   For a device, its rules can physically only push traffic **directly**, never into the tunnel, so
   they can't "take the internet down".

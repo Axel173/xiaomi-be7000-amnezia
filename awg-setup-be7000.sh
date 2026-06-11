@@ -156,23 +156,43 @@ if [ -f "$AWG_DIR/bin/amneziawg-go.user" ]; then
     log "Найден пользовательский amneziawg-go.user, ставлю..."
     cp "$AWG_DIR/bin/amneziawg-go.user" "$AWG_DIR/amneziawg-go"
     chmod +x "$AWG_DIR/amneziawg-go"
-    cp "$AWG_DIR/amneziawg-go" "$AWG_DIR/amneziawg-go.working.bak"
     ok "amneziawg-go установлен ($("$AWG_DIR/amneziawg-go" --version 2>&1 | head -1))"
 fi
 if [ -f "$AWG_DIR/bin/awg.user" ]; then
     log "Найден пользовательский awg.user, ставлю..."
     cp "$AWG_DIR/bin/awg.user" "$AWG_DIR/awg"
     chmod +x "$AWG_DIR/awg"
-    cp "$AWG_DIR/awg" "$AWG_DIR/awg.working.bak"
     ok "awg установлен ($("$AWG_DIR/awg" --version 2>&1 | head -1))"
 fi
 
+# Xray + tun2socks (hev) — альт-транспорт (Фаза 1). ВАЖНО про бюджет флеша: /data
+# всего ~20 МБ, а xray.user ~7.6 МБ. Если cp'нуть (как amneziawg-go), на момент
+# установки была бы ВТОРАЯ копия (+7.6 МБ) → пик не влезает. Поэтому xray/hev
+# переносим ЧЕРЕЗ mv (rename на том же ФС = без удвоения места). Источник bin/*.user
+# в git/payload → при следующей установке зальётся снова. xray-configs/ — для
+# vless/JSON-конфигов (be7000.ps1). Наличие бинарей необязательно: awg-only установка
+# просто пропустит этот блок.
+if [ -f "$AWG_DIR/bin/xray.user" ]; then
+    log "Найден xray.user, ставлю (mv, без удвоения флеша)..."
+    mv "$AWG_DIR/bin/xray.user" "$AWG_DIR/xray"
+    chmod +x "$AWG_DIR/xray"
+    ok "xray установлен ($("$AWG_DIR/xray" version 2>&1 | head -1))"
+fi
+if [ -f "$AWG_DIR/bin/hev.user" ]; then
+    log "Найден hev.user (tun2socks), ставлю..."
+    mv "$AWG_DIR/bin/hev.user" "$AWG_DIR/hev"
+    chmod +x "$AWG_DIR/hev"
+    ok "hev (tun2socks) установлен"
+fi
+[ -f "$AWG_DIR/xray-transport.sh" ] && chmod +x "$AWG_DIR/xray-transport.sh"
+mkdir -p "$AWG_DIR/xray-configs"
+
 # Подсказка для AWG 2.0
 if grep -qE '^(S3|S4)\s*=' "$AWG_CONF" || grep -qE '^H[1-4]\s*=\s*[0-9]+-[0-9]+' "$AWG_CONF"; then
-    if [ ! -f "$AWG_DIR/amneziawg-go.working.bak" ] || [ ! -f "$AWG_DIR/awg.working.bak" ]; then
-        warn "Конфиг AWG 2.0 (есть S3/S4 или диапазон H), но нет пользовательских"
-        warn "бинарников. Вендорный awg_setup.sh скачает старые версии, которые НЕ"
-        warn "понимают S3/S4. Будет ошибка 'Line unrecognized: S3=N'."
+    if [ ! -x "$AWG_DIR/amneziawg-go" ] || [ ! -x "$AWG_DIR/awg" ]; then
+        warn "Конфиг AWG 2.0 (есть S3/S4 или диапазон H), но нет рабочих бинарников"
+        warn "AmneziaWG. Вендорный awg_setup.sh их БОЛЬШЕ НЕ качает (старые версии с"
+        warn "github ломали S3/S4) — он просто упадёт с exit 1, awg0 не поднимется."
         warn "Собери бинарники по инструкции (Приложение Г) и положи в"
         warn "$AWG_DIR/bin/{amneziawg-go.user,awg.user}, потом перезапусти этот скрипт."
         warn "Альтернатива: добавь на VPS протокол AmneziaWG Legacy и используй его конфиг."
@@ -608,26 +628,24 @@ fi
 # 7.5 ЧИСТКА ИЗБЫТОЧНЫХ bin/*.user (экономия флеша — /data на стоке всего ~20 МБ)
 # ============================================================================
 # bin/{amneziawg-go,awg}.user — КАНОНИЧЕСКИЙ источник бинарей, нужный ТОЛЬКО на
-# установке: выше (секция 0.3) мы уже скопировали их в рабочие бинари и в
-# .working.bak. В runtime (boot/heal/switch/watchdog) bin/*.user не читает НИКТО
-# — самовосстановление идёт из .working.bak (awg-heal.sh). На стоке /data всего
-# ~20 МБ, а amneziawg-go ~4.7 МБ: держать его в ТРЁХ копиях (рабочий +
-# .working.bak + bin/*.user) расточительно. Скрипт дошёл сюда => awg0 поднят,
-# рабочие бинари корректны, значит .working.bak (снятый с них) валиден — можно
-# удалить bin/*.user. Источник не теряется: он в git и в payload be7000.ps1 →
-# при следующей установке зальётся снова (и эта же секция снова подчистит).
-# СТРАХОВКА ВАЖНЕЕ МЕСТА: удаляем bin/$b.user только если .working.bak реально
-# есть и его размер совпадает с рабочим бинарём; иначе оставляем как запасной
-# источник восстановления (лучше потратить флеш, чем остаться без самопочинки).
+# установке: выше (секция 0.3) мы уже скопировали их в рабочие бинари. В runtime
+# (boot/heal/switch/watchdog) bin/*.user не читает НИКТО. На стоке /data всего
+# ~20 МБ, а amneziawg-go ~4.8 МБ: держать его второй копией в bin/ расточительно.
+# Скрипт дошёл сюда => awg0 поднят, т.е. рабочие бинари ГАРАНТИРОВАННО исправны
+# (туннель работает) — можно удалить bin/*.user. Источник не теряется: он в git и
+# в payload be7000.ps1 → при следующей установке зальётся снова (и эта же секция
+# снова подчистит). Раньше для удаления требовался валидный .working.bak; теперь
+# .working.bak НЕ создаём (curl-угроза, ради которой он жил, устранена — см.
+# awg_setup.sh), а исправность проверяем НАПРЯМУЮ: рабочий бинарь есть и его размер
+# совпадает с источником bin/$b.user (=> copy секции 0.3 прошла успешно).
 for b in amneziawg-go awg; do
     [ -f "$AWG_DIR/bin/$b.user" ] || continue
-    wb="$AWG_DIR/$b.working.bak"
-    if [ -f "$wb" ] && [ -f "$AWG_DIR/$b" ] && \
-       [ "$(stat -c%s "$wb" 2>/dev/null)" = "$(stat -c%s "$AWG_DIR/$b" 2>/dev/null)" ]; then
+    if [ -f "$AWG_DIR/$b" ] && \
+       [ "$(stat -c%s "$AWG_DIR/bin/$b.user" 2>/dev/null)" = "$(stat -c%s "$AWG_DIR/$b" 2>/dev/null)" ]; then
         rm -f "$AWG_DIR/bin/$b.user"
-        ok "bin/$b.user удалён (есть рабочий + валидный .working.bak; источник — git/payload)"
+        ok "bin/$b.user удалён (рабочий бинарь на месте, размер совпал; источник — git/payload)"
     else
-        warn "bin/$b.user оставлен: нет валидного .working.bak (страховка важнее места)"
+        warn "bin/$b.user оставлен: рабочего $b нет или размер не совпал с источником"
     fi
 done
 rmdir "$AWG_DIR/bin" 2>/dev/null || true   # уберём каталог, если опустел

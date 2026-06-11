@@ -129,6 +129,14 @@ cmd_repair() {
     # ушли бы в VPN. apply идемпотентен и трогает только прямой путь.
     [ -x "$AWG_DIR/apply-bypass.sh" ] && "$AWG_DIR/apply-bypass.sh" apply
 
+    # 6.6. Активный транспорт. Шаги 1/5 выше вернули default table 1000 на awg0 и
+    # FORWARD awg0 — если активен Xray, переигрываем его поверх (xray-transport.sh up
+    # идемпотентен: демоны живы — не перезапускает, заново ставит default dev xtun +
+    # FORWARD xtun + DNS). Без этого после fw3-reload xray-режим «сползал» бы на awg.
+    if [ "$(cat "$AWG_DIR/.transport" 2>/dev/null)" = "xray" ] && [ -x "$AWG_DIR/xray-transport.sh" ]; then
+        "$AWG_DIR/xray-transport.sh" up
+    fi
+
     # 7. снимаем лок awg-heal — если он висит с прошлого boot и реально
     # что-то опять отвалится, cron-тик через минуту восстановит сам.
     rm -f "$HEAL_LOCK" 2>/dev/null

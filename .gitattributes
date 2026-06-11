@@ -4,9 +4,14 @@
 # поэтому при редактировании и заливке (WinSCP/base64) скрипты не сломаются.
 *.sh                  text eol=lf
 *.conf                text eol=lf
+*.yaml                text eol=lf
+*.yml                 text eol=lf
 notify.conf.example   text eol=lf
 iplist.conf.example   text eol=lf
 awg.conf.example      text eol=lf
+
+# Бинарники под роутер (ELF/UPX) — НИКОГДА не трогать text-конверсией (иначе порча).
+*.user                binary
 
 # .ps1/.bat намеренно НЕ трогаем: они работают на ПК как есть (UTF-8 BOM
 # важен для PowerShell 5 на ру-Windows), пусть остаются под глобальным

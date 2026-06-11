@@ -1,0 +1,11 @@
+tunnel:
+  name: xtun
+  mtu: 8500
+  ipv4: 198.18.0.1
+socks5:
+  port: 10808
+  address: 127.0.0.1
+  udp: 'udp'
+misc:
+  log-file: /tmp/hev.log
+  log-level: warn

@@ -8,3 +8,6 @@ notify.conf
 /backups/
 /diag/
 *.bak
+# Xray-секреты (vless-ключи внутри). hev.yaml/xray-transport.sh — НЕ секрет, в git.
+xray.json
+/xray-configs/

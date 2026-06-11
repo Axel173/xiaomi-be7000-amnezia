@@ -67,6 +67,49 @@ detect_binary_version() {
     fi
 }
 
+# ==================== 0. ТРАНСПОРТ VPN ====================
+# Какой протокол НЕСЁТ трафик сейчас: AmneziaWG (awg0) или Xray (xtun). Маркировка
+# (fwmark/ipset/ip rule) у них ОБЩАЯ — меняется только default в table 1000
+# (awg0<->xtun). Без этой секции статус показывал бы handshake awg0, даже когда
+# реально активен xray, а awg0 — лишь тёплый резерв (вводило в заблуждение).
+header "Транспорт VPN"
+TRANSPORT=$(cat "$AWG_DIR/.transport" 2>/dev/null | tr -d ' \r\n')
+[ -z "$TRANSPORT" ] && TRANSPORT=awg     # нет файла = режим awg (как до Xray)
+if [ "$TRANSPORT" = "xray" ]; then
+    active_xray=$(cat "$AWG_DIR/.xray-active" 2>/dev/null | tr -d '\r')
+    status "Активный протокол:" "Xray (xtun)" "$GREEN"
+    status "Активный xray-конфиг:" "${active_xray:-?}"
+    if [ -f /tmp/xray.pid ] && kill -0 "$(cat /tmp/xray.pid 2>/dev/null)" 2>/dev/null; then
+        status "Демон xray:" "жив (pid $(cat /tmp/xray.pid))" "$GREEN"
+    else
+        status "Демон xray:" "НЕ запущен" "$RED"
+    fi
+    if [ -f /tmp/hev.pid ] && kill -0 "$(cat /tmp/hev.pid 2>/dev/null)" 2>/dev/null; then
+        status "tun2socks (hev):" "жив (pid $(cat /tmp/hev.pid))" "$GREEN"
+    else
+        status "tun2socks (hev):" "НЕ запущен" "$RED"
+    fi
+    if ip link show xtun >/dev/null 2>&1; then
+        status "Интерфейс xtun:" "поднят" "$GREEN"
+    else
+        status "Интерфейс xtun:" "НЕ создан" "$RED"
+    fi
+    # Реальный выходной IP активного протокола — через локальный socks Xray
+    # (порт 10808 = SOCKS_PORT в xray-transport.sh). curl --interface awg0 ниже
+    # это НЕ покажет: он тестирует резерв awg0, а не путь xtun->xray.
+    ip_xray=$(curl -s --max-time 8 --socks5-hostname 127.0.0.1:10808 https://api.ipify.org 2>/dev/null)
+    if [ -n "$ip_xray" ]; then
+        status "Выходной IP (xray):" "$ip_xray" "$GREEN"
+    else
+        status "Выходной IP (xray):" "недоступен" "$RED"
+    fi
+    status "AmneziaWG (awg0):" "тёплый резерв" "$BLUE"
+else
+    active_awg=$(cat "$AWG_DIR/.active" 2>/dev/null | tr -d '\r')
+    status "Активный протокол:" "AmneziaWG (awg0)" "$GREEN"
+    status "Активный конфиг:" "${active_awg:-?}"
+fi
+
 # ==================== 1. ИНТЕРФЕЙС AWG0 ====================
 header "Интерфейс awg0"
 if ip link show awg0 >/dev/null 2>&1; then
@@ -173,14 +216,18 @@ else
 fi
 if ip link show awg0 >/dev/null 2>&1; then
     ip_vpn=$(curl -s --interface awg0 --max-time 5 https://api.ipify.org 2>/dev/null)
+    # При активном xray awg0 — лишь тёплый резерв: помечаем как «резерв», а не
+    # как «IP через VPN», и не пугаем красным «совпадает с прямым» (реальный
+    # выход показан выше в секции «Транспорт VPN»).
+    if [ "$TRANSPORT" = "xray" ]; then vpn_label="IP awg0 (резерв):"; else vpn_label="IP через VPN:"; fi
     if [ -n "$ip_vpn" ]; then
-        if [ -n "$ip_direct" ] && [ "$ip_direct" = "$ip_vpn" ]; then
-            status "IP через VPN:" "$ip_vpn — СОВПАДАЕТ С ПРЯМЫМ!" "$RED"
+        if [ "$TRANSPORT" != "xray" ] && [ -n "$ip_direct" ] && [ "$ip_direct" = "$ip_vpn" ]; then
+            status "$vpn_label" "$ip_vpn — СОВПАДАЕТ С ПРЯМЫМ!" "$RED"
         else
-            status "IP через VPN:" "$ip_vpn" "$GREEN"
+            status "$vpn_label" "$ip_vpn" "$GREEN"
         fi
     else
-        status "IP через VPN:" "недоступен" "$RED"
+        status "$vpn_label" "недоступен" "$RED"
     fi
 fi
 
