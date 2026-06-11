@@ -4,7 +4,7 @@
 # Объединяет установщик (бывш. installer/amnezia-install.ps1) и меню
 # управления (бывш. vpn-toggle.ps1). На старте детектит, установлен ли AWG:
 # нет -> предлагает установку; есть -> меню управления. -Install/-Manage
-# форсируют режим. Payload (.sh/.user) берётся из корня репо ($SCRIPT_DIR).
+# форсируют режим. Payload берётся из репо ($SCRIPT_DIR): .sh из корня, бинари из bin/.
 # ============================================================
 # Тонкое меню поверх SSH — всё реальное действие делают
 # серверные скрипты на роутере (switch-vpn.sh / domain.sh /
@@ -1981,7 +1981,7 @@ function PreFlight {
     $binFound = @()
     $binBad = $false
     foreach ($k in $BIN_FILES.Keys) {
-        $p = Join-Path $SCRIPT_DIR $k
+        $p = Join-Path $SCRIPT_DIR $BIN_FILES[$k]
         if (-not (Test-Path $p)) {
             Write-Info "$k (AWG 2.0 бинарник, нет -- нужен только если конфиг AWG 2.0 без Legacy)"
             continue
@@ -2156,7 +2156,7 @@ function Upload-AllFiles {
 
     # Бинарники в bin/
     foreach ($k in $BIN_FILES.Keys) {
-        $local = Join-Path $SCRIPT_DIR $k
+        $local = Join-Path $SCRIPT_DIR $BIN_FILES[$k]
         if (-not (Test-Path $local)) { continue }
         Write-Info "  -> bin/$k"
         if (-not (Upload-File -LocalPath $local -RemotePath "$AWG_DIR/bin/$k")) {
@@ -2554,7 +2554,7 @@ function Action-Diagnose {
         else { Write-Info "$f (опц., нет)" }
     }
     foreach ($k in $BIN_FILES.Keys) {
-        $p = Join-Path $SCRIPT_DIR $k
+        $p = Join-Path $SCRIPT_DIR $BIN_FILES[$k]
         if (Test-Path $p) {
             $sizeKb = [math]::Round((Get-Item $p).Length / 1024, 1)
             Write-Ok "$k (AWG 2.0 бинарник, $sizeKb KB)"
