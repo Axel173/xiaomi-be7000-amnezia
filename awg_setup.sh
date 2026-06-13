@@ -20,20 +20,20 @@ else
     echo "$interface_config created"
 fi
 
-# Downloading AmneziaWG binaries if needed
+# Проверяем бинари AmneziaWG. ВАЖНО: НЕ качаем их с github (как в оригинале
+# Шалина) — там СТАРАЯ AWG 1.x, которая не понимает S3/S4/H-диапазоны AWG 2.0
+# (awg setconf падает с "Line unrecognized: S3="). Канонический источник бинарей —
+# установщик (be7000.ps1 -> bin/*.user). Если рабочего бинаря нет — ЯВНО падаем
+# (НЕ тянем старьё с внешнего github; репо может исчезнуть).
+# Восстановление при пропаже/порче = переустановка с ПК
+# (отдельной .working.bak-копии на роутере больше не держим — экономия флеша).
 if [ ! -f "awg" ] || [ ! -f "amneziawg-go" ]; then
-    echo "AmneziaWG not found. Downloading..."    
-    curl -L -o awg.tar.gz https://github.com/alexandershalin/amneziawg-be7000/raw/main/awg.tar.gz
-    curl -L -o clear_firewall_settings.sh https://github.com/alexandershalin/amneziawg-be7000/raw/main/clear_firewall_settings.sh
-    tar -xzvf /data/usr/app/awg/awg.tar.gz
-    chmod +x /data/usr/app/awg/amneziawg-go
-    chmod +x /data/usr/app/awg/awg 
-    chmod +x /data/usr/app/awg/clear_firewall_settings.sh
-    rm /data/usr/app/awg/awg.tar.gz    
-    echo "Archive downloaded and unpacked. Setting up awg0 interface"
-else
-    echo "AmneziaWG binaries exist, setting up awg0 interface"
+    echo "ERROR: бинари AmneziaWG (awg/amneziawg-go) не найдены." >&2
+    echo "       Поставь их установщиком (be7000.ps1, bin/*.user). Качать старую" >&2
+    echo "       AWG 1.x с github НЕ будем — она ломает конфиг AWG 2.0." >&2
+    exit 1
 fi
+echo "AmneziaWG binaries exist, setting up awg0 interface"
 
 
 # Set up AmneziaWG interface

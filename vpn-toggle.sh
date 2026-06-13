@@ -133,8 +133,9 @@ cmd_repair() {
     # FORWARD awg0 — если активен Xray, переигрываем его поверх (xray-transport.sh up
     # идемпотентен: демоны живы — не перезапускает, заново ставит default dev xtun +
     # FORWARD xtun + DNS). Без этого после fw3-reload xray-режим «сползал» бы на awg.
-    if [ "$(cat "$AWG_DIR/.transport" 2>/dev/null)" = "xray" ] && [ -x "$AWG_DIR/xray-transport.sh" ]; then
-        "$AWG_DIR/xray-transport.sh" up
+    repair_t=$(cat "$AWG_DIR/.transport" 2>/dev/null | tr -d ' \r\n')
+    if [ -n "$repair_t" ] && [ "$repair_t" != "awg" ] && [ -x "$AWG_DIR/transport.sh" ]; then
+        "$AWG_DIR/transport.sh" up "$repair_t"
     fi
 
     # 7. снимаем лок awg-heal — если он висит с прошлого boot и реально

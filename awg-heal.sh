@@ -40,29 +40,31 @@ echo "===== awg-heal $(date) ====="
 
 cd "$AWG_DIR" || exit 1
 
-# 0. Подготовка конфига — чистим пустые I-поля
-echo "--- preparing config ---"
-if grep -qE '^I[1-5]\s*=\s*$' awg.conf 2>/dev/null; then
-    sed -i '/^I[1-5]\s*=\s*$/d' awg.conf
-    echo "cleaned empty I1..I5 from awg.conf"
+# 0+1. AmneziaWG: подготовка конфига + поднятие awg0 — несущая (если активен awg)
+# ИЛИ тёплый резерв (если активен xray). Всё это нужно ТОЛЬКО когда awg установлен
+# (есть awg.conf). При xray-only (awg.conf нет) — пропускаем целиком: ядро + xray
+# поднимутся ниже без awg0. Это и есть расцепка, делающая возможной установку без awg.
+if [ -f awg.conf ]; then
+    echo "--- preparing awg config ---"
+    if grep -qE '^I[1-5]\s*=\s*$' awg.conf 2>/dev/null; then
+        sed -i '/^I[1-5]\s*=\s*$/d' awg.conf
+        echo "cleaned empty I1..I5 from awg.conf"
+    fi
+    # amnezia_for_awg.conf нужен вендорному awg_setup.sh
+    if [ ! -f amnezia_for_awg.conf ]; then
+        cp awg.conf amnezia_for_awg.conf
+        echo "amnezia_for_awg.conf recreated from awg.conf"
+    fi
+    # Аналогично awg0.conf — могут чистить пустые I
+    if [ -f awg0.conf ] && grep -qE '^I[1-5]\s*=\s*$' awg0.conf; then
+        sed -i '/^I[1-5]\s*=\s*$/d' awg0.conf
+    fi
+    # Поднимаем awg0 (вендорный awg_setup.sh, идемпотентный — НЕ перекачивает бинарники
+    # если они есть; при их отсутствии честно падает с exit 1).
+    echo "--- bringing up awg0 ---"
+    ip link del awg0 2>/dev/null
+    ./awg_setup.sh
 fi
-# amnezia_for_awg.conf нужен вендорному awg_setup.sh
-if [ ! -f amnezia_for_awg.conf ] && [ -f awg.conf ]; then
-    cp awg.conf amnezia_for_awg.conf
-    echo "amnezia_for_awg.conf recreated from awg.conf"
-fi
-# Аналогично awg0.conf — могут чистить пустые I
-if [ -f awg0.conf ] && grep -qE '^I[1-5]\s*=\s*$' awg0.conf; then
-    sed -i '/^I[1-5]\s*=\s*$/d' awg0.conf
-fi
-
-# 1. Поднимаем туннель (вендорный awg_setup.sh, идемпотентный — НЕ перекачивает
-# бинарники если они есть; при их отсутствии честно падает с exit 1).
-# (.working.bak больше не используется: curl-угроза, ради которой он жил, устранена;
-#  восстановление бинарей при пропаже/порче = переустановка с ПК.)
-echo "--- bringing up awg0 ---"
-ip link del awg0 2>/dev/null
-./awg_setup.sh
 
 # 2. Прописываем upstream DNS изнутри VPN (защита от подмен провайдером).
 # DNS адрес берём из awg.conf, fallback — 172.29.172.254 (типовой у Amnezia)
@@ -93,37 +95,26 @@ if [ -x ./iplist-update.sh ]; then
     ./iplist-update.sh
 fi
 
-# 5. Маршрутизация + FORWARD ACCEPT — либо через split-route.sh, либо
-# inline-фоллбэк если его нет.
-if [ -x ./split-route.sh ]; then
-    echo "--- running split-route.sh ---"
+# 5. ОБЩЕЕ ЯДРО маршрутизации (транспорт-агностично): маркировка ipset -> MARK 0x1
+# + ip rule fwmark -> table $TABLE. Несущую (default в table $TABLE) + FORWARD/MASQ/DNS
+# кладёт АКТИВНЫЙ транспорт ниже (секция 5.6). Фолбэки: старый split-route.sh
+# (делает ядро+awg-несущую), затем inline-ядро.
+echo "--- mark-core (ядро: маркировка + ip rule) ---"
+if [ -x ./mark-core.sh ]; then
+    ./mark-core.sh
+elif [ -x ./split-route.sh ]; then
     ./split-route.sh
 else
-    echo "--- inline routing rules ---"
-    # таблица
-    ip route flush table $TABLE 2>/dev/null
-    ip route add default dev awg0 table $TABLE
     ip rule del fwmark 0x1 table $TABLE 2>/dev/null
     ip rule add fwmark 0x1 table $TABLE pref 99
-
-    # маркировка для обоих ipset
     for set in awg_list iplist_set; do
         if ipset list -n 2>/dev/null | grep -qx "$set"; then
             iptables -t mangle -C PREROUTING -m set --match-set "$set" dst -j MARK --set-mark 0x1 2>/dev/null || \
                 iptables -t mangle -A PREROUTING -m set --match-set "$set" dst -j MARK --set-mark 0x1
+            iptables -t mangle -C OUTPUT -m set --match-set "$set" dst -j MARK --set-mark 0x1 2>/dev/null || \
+                iptables -t mangle -A OUTPUT -m set --match-set "$set" dst -j MARK --set-mark 0x1
         fi
     done
-
-    # NAT
-    iptables -t nat -D POSTROUTING -o awg0 -j MASQUERADE 2>/dev/null
-    iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
-
-    # FORWARD ACCEPT — без него на стоковой BE7000 fw3 политика DROP
-    # дропает весь LAN-трафик к awg0 ("открываются только российские сайты")
-    iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null
-    iptables -I FORWARD 1 -o awg0 -j ACCEPT
-    iptables -I FORWARD 1 -i awg0 -j ACCEPT
 fi
 
 # 5.5. Восстанавливаем «вырезы мимо VPN» (исключения устройств / SSID / guest).
@@ -136,12 +127,24 @@ if [ -x ./apply-bypass.sh ]; then
     ./apply-bypass.sh apply
 fi
 
-# 5.6. Активный транспорт. awg уже поднят выше (как туннель/тёплый резерв); если
-# активен Xray — поднимаем его ПОВЕРХ (свап default table 1000 awg0->xtun + DNS).
-# Флаг .transport переживает ребут; нет файла => awg (поведение как раньше).
-if [ "$(cat "$AWG_DIR/.transport" 2>/dev/null)" = "xray" ] && [ -x ./xray-transport.sh ]; then
-    echo "--- transport=xray: bring up xray over awg ---"
-    ./xray-transport.sh up
+# 5.6. АКТИВНЫЙ ТРАНСПОРТ кладёт несущую (default в table $TABLE) + FORWARD/MASQ/DNS,
+# каждый через свой плагин (единый контракт up). awg0 уже поднят выше (секция 1) как
+# несущая (для awg) или тёплый резерв (для xray). Флаг .transport переживает ребут;
+# нет файла => awg.
+active_t=$(cat "$AWG_DIR/.transport" 2>/dev/null | tr -d ' \r\n')
+[ -z "$active_t" ] && active_t=awg
+echo "--- active transport: $active_t ---"
+# Несущую активного транспорта поднимает ОРКЕСТРАТОР (transport.sh up <name>) — единая
+# точка, через неё же подключатся будущие транспорты (hysteria2…) без правок heal.
+# mark-core применён выше; transport.sh up идемпотентно переиграет его. Фолбэк — прямой
+# вызов плагина (старый роутер без transport.sh).
+if [ -x ./transport.sh ]; then
+    ./transport.sh up "$active_t"
+else
+    case "$active_t" in
+        xray) [ -x ./xray-transport.sh ] && ./xray-transport.sh up ;;
+        *)    [ -x ./transport-awg.sh ] && ./transport-awg.sh up ;;
+    esac
 fi
 
 # 6. Диагностика
@@ -177,32 +180,66 @@ fi
 # При xray-транспорте вердикт по здоровью Xray (awg0 может не давать handshake,
 # если awg заблокирован и держится лишь как тёплый резерв). hs>0 трактуется ниже
 # как «VPN жив» -> boot-ok; иначе boot-fail.
-if [ "$(cat "$AWG_DIR/.transport" 2>/dev/null)" = "xray" ] && [ -x "$AWG_DIR/xray-transport.sh" ]; then
-    if "$AWG_DIR/xray-transport.sh" health >/dev/null 2>&1; then hs=$(date +%s); else hs=0; fi
+heal_t=$(cat "$AWG_DIR/.transport" 2>/dev/null | tr -d ' \r\n')
+[ -z "$heal_t" ] && heal_t=awg
+# Человекочитаемое имя транспорта для письма (generic — под hy2 добавится строка).
+tlabel=$(case "$heal_t" in xray) echo "Xray" ;; hy2) echo "Hysteria2" ;; awg) echo "AmneziaWG" ;; *) echo "$heal_t" ;; esac)
+if [ "$heal_t" != "awg" ] && [ -x "$AWG_DIR/transport.sh" ]; then
+    # tunnel-транспорт (xray/hy2/…): живость берём от health активного транспорта (через
+    # оркестратор), а не от awg0-handshake (awg может быть лишь тёплым резервом).
+    if "$AWG_DIR/transport.sh" health "$heal_t" >/dev/null 2>&1; then hs=$(date +%s); else hs=0; fi
 fi
-active=$(cat "$AWG_DIR/.active" 2>/dev/null)
+# Имя активного конфига для письма зависит от НЕСУЩЕГО транспорта: tunnel несёт свой
+# .<t>-active (xray → .xray-active), а .active — лишь тёплый awg-резерв (иначе письмо
+# назвало бы не тот конфиг). «Handshake» — термин awg; у tunnel его нет (живость от health-пробы).
+if [ "$heal_t" != "awg" ]; then
+    active="$tlabel $(cat "$AWG_DIR/.$heal_t-active" 2>/dev/null)"
+else
+    active="AmneziaWG $(cat "$AWG_DIR/.active" 2>/dev/null)"
+fi
 if [ -x "$NOTIFY_EVENT" ]; then
     if [ "$hs" -gt 0 ]; then
         age=$(( $(date +%s) - hs ))
         ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
-        echo "verdict: awg0 up, handshake ${age}s"
+        if [ "$heal_t" != "awg" ]; then hs_line="Проверка связи: OK"; else hs_line="Handshake: ${age} сек назад"; fi
+        echo "verdict: VPN up (транспорт $heal_t)"
         "$NOTIFY_EVENT" boot-ok 0 "BE7000: загрузка OK, VPN поднят" \
 "После запуска/перезагрузки роутер поднял туннель.
-Конфиг: ${active:-?}. Handshake: ${age} сек назад.
+Конфиг: ${active:-?}. ${hs_line}.
 Внешний IP: ${ip:-неизвестен}.
 
 (Письмо приходит раз за загрузку — если роутер ребутнулся сам,
 это сигнал: скачок питания, краш или кто-то перезагрузил.)" >/dev/null 2>&1
     else
-        if ip link show awg0 >/dev/null 2>&1; then awg0_state="есть, но handshake не пришёл"; else awg0_state="не создан"; fi
-        echo "verdict: awg0 down ($awg0_state)"
-        "$NOTIFY_EVENT" boot-fail 0 "BE7000: после загрузки VPN НЕ поднялся" \
+        if [ "$heal_t" != "awg" ]; then
+            # Несущая xtun (общий hev/tun2socks) — у всех альт-транспортов (xray/hy2). Для
+            # них даём деталь по xtun; для прочих tunnel с иным tun-именем — обобщённо.
+            if { [ "$heal_t" = "xray" ] || [ "$heal_t" = "hy2" ]; } && ip link show xtun >/dev/null 2>&1; then
+                carrier_state="xtun есть, но проба egress не прошла"
+            elif [ "$heal_t" = "xray" ] || [ "$heal_t" = "hy2" ]; then
+                carrier_state="xtun не создан"
+            else
+                carrier_state="несущая $tlabel не поднялась"
+            fi
+            echo "verdict: $heal_t down ($carrier_state)"
+            "$NOTIFY_EVENT" boot-fail 0 "BE7000: после загрузки VPN НЕ поднялся" \
+"awg-heal отработал, но транспорт $tlabel не поднялся ($carrier_state).
+Конфиг: ${active:-?}. Трафик к сайтам из списка сейчас не идёт.
+Загляни по SSH: cat /tmp/awg-startup.log; $AWG_DIR/awg-status.sh test.
+
+(Если VPS просто мёртв — watchdog в ближайшие 2 мин переведёт роутер
+в прямой режим и пришлёт своё письмо.)" >/dev/null 2>&1
+        else
+            if ip link show awg0 >/dev/null 2>&1; then awg0_state="есть, но handshake не пришёл"; else awg0_state="не создан"; fi
+            echo "verdict: awg0 down ($awg0_state)"
+            "$NOTIFY_EVENT" boot-fail 0 "BE7000: после загрузки VPN НЕ поднялся" \
 "awg-heal отработал, но туннель не поднялся (awg0: $awg0_state).
 Конфиг: ${active:-?}. Трафик к сайтам из списка сейчас не идёт.
 Загляни по SSH: cat /tmp/awg-startup.log; $AWG_DIR/awg-status.sh test.
 
 (Если VPS просто мёртв — watchdog в ближайшие 2 мин переведёт роутер
 в прямой режим и пришлёт своё письмо.)" >/dev/null 2>&1
+        fi
     fi
 fi
 

@@ -6,6 +6,12 @@
 # cidr4 с opencck, как было). Можно сузить до конкретных сайтов (IPLIST_SITES)
 # или задать свой URL (IPLIST_URL) — см. iplist.conf.example.
 #
+# КАСТОМНЫЙ ЛОКАЛЬНЫЙ СПИСОК (IPLIST_CUSTOM_MODE, ортогонален источнику скачивания):
+#   only  — НЕ качаем вообще, set наполняется ТОЛЬКО из $IPLIST_CUSTOM_FILE (офлайн);
+#   merge — качаем как обычно, потом доклеиваем $IPLIST_CUSTOM_FILE поверх;
+#   пусто — кастома нет (поведение как раньше). Файл (CIDR/IP построчно) лежит на
+#   /data → переживает ребут; на ПК заливается через be7000 (Источник списка IP).
+#
 # УСТОЙЧИВОСТЬ к недоступности источника (важно для крона в 5:00 и для boot):
 # боевой ipset трогаем ТОЛЬКО после удачного скачивания (атомарный swap), поэтому
 # сбой источника НЕ рушит маршрутизацию. set наполнен → остаётся прошлый список;
@@ -33,14 +39,20 @@ SNAP_FILE="$AWG_DIR/.iplist.snapshot" # последний удачно скач
 #   IPLIST_URL       — полный URL, используется как есть (escape hatch / др. источник);
 #   IPLIST_SITES     — список сайтов через пробел → собирается &site=... к IPLIST_BASE
 #                      (игнорируется, если задан IPLIST_URL);
-#   IPLIST_BASE      — база для режима сайтов (по умолчанию opencck cidr4);
-#   IPLIST_MIN_LINES — порог «подозрительно мало строк» (деф. 10; снизь при узком списке).
+#   IPLIST_BASE        — база для режима сайтов (по умолчанию opencck cidr4);
+#   IPLIST_MIN_LINES   — порог «подозрительно мало строк» (деф. 10; снизь при узком списке);
+#   IPLIST_CUSTOM_MODE — only|merge|'' — кастомный локальный список (ортогонален источнику);
+#   IPLIST_CUSTOM_FILE — путь к файлу кастомного списка (деф. $AWG_DIR/iplist.custom).
 IPLIST_BASE='https://iplist.opencck.org/?format=text&data=cidr4'
 IPLIST_URL=''
 IPLIST_SITES=''
 IPLIST_MIN_LINES=10
+IPLIST_CUSTOM_MODE=''                        # only|merge|'' — кастомный локальный список (ортогонален источнику скачивания)
+IPLIST_CUSTOM_FILE="$AWG_DIR/iplist.custom"  # файл кастомного списка (CIDR/IP построчно), переживает ребут
 [ -f "$AWG_DIR/iplist.conf" ] && . "$AWG_DIR/iplist.conf"
 case "$IPLIST_MIN_LINES" in ''|*[!0-9]*) IPLIST_MIN_LINES=10 ;; esac   # защита от мусора в конфиге
+case "$IPLIST_CUSTOM_MODE" in only|merge) ;; *) IPLIST_CUSTOM_MODE='' ;; esac   # только эти два режима, иначе off
+[ -n "$IPLIST_CUSTOM_FILE" ] || IPLIST_CUSTOM_FILE="$AWG_DIR/iplist.custom"
 
 if [ -n "$IPLIST_URL" ]; then
     URL="$IPLIST_URL"
@@ -51,21 +63,37 @@ else
     URL="$IPLIST_BASE"
 fi
 
-# Залить CIDR-список из файла в боевой ipset атомарно (через временный _new).
-# Единый код для свежескачанного списка и для fallback-снимка.
-load_set_from_file() {
+# Залить CIDR-список из ОДНОГО ИЛИ НЕСКОЛЬКИХ файлов в боевой ipset атомарно
+# (через временный _new). Единый код для скачанного списка, кастомного файла
+# (merge: оба сразу) и fallback-снимка.
+# СТРАХОВКА: swap делаем ТОЛЬКО если в _new реально легло >0 записей — иначе
+# кривой/пустой источник (формат не распознан, ipset отбросил всё) молча обнулил
+# бы боевой set и увёл CDN-подсети мимо VPN. Возвращает 0 (swap сделан) / 1 (set не тронут).
+load_set_from_files() {
     ipset list -n 2>/dev/null | grep -qx "$SET" || \
         ipset create "$SET" hash:net hashsize 4096 maxelem 1000000
     ipset destroy "${SET}_new" 2>/dev/null
     ipset create "${SET}_new" hash:net hashsize 4096 maxelem 1000000
-    while IFS= read -r cidr; do
-        case "$cidr" in
-            ''|'#'*) continue ;;
-        esac
-        ipset add "${SET}_new" "$cidr" 2>/dev/null
-    done < "$1"
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        while IFS= read -r cidr; do
+            case "$cidr" in
+                ''|'#'*) continue ;;
+            esac
+            ipset add "${SET}_new" "$cidr" 2>/dev/null
+        done < "$f"
+    done
+    n=$(ipset list "${SET}_new" 2>/dev/null | awk '/^Number of entries:/{print $NF}')
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    if [ "$n" -eq 0 ]; then
+        echo "load: 0 валидных записей из [$*] — боевой set НЕ тронут"
+        ipset destroy "${SET}_new" 2>/dev/null
+        return 1
+    fi
     ipset swap "${SET}_new" "$SET"
     ipset destroy "${SET}_new"
+    echo "load: $n записей из [$*]"
+    return 0
 }
 
 # Флаг уведомлений
@@ -79,59 +107,95 @@ mail_event() {
 
 exec >>"$LOG" 2>&1
 echo "===== $(date) (notify=$NOTIFY) ====="
-echo "source: $URL"
+echo "custom mode: ${IPLIST_CUSTOM_MODE:-off} (file: $IPLIST_CUSTOM_FILE)"
 
-# 1. Скачать во временный файл. Боевой ipset НЕ трогаем, пока скачанное не
-#    признано валидным, — поэтому сбой источника не рушит маршрутизацию.
-DOWNLOAD_OK=0
+# 1+2. Наполнение боевого ipset. Боевой set трогаем ТОЛЬКО валидным набором
+#      (>0 записей, см. load_set_from_files), поэтому сбой/кривой источник не
+#      рушит маршрутизацию.
+USED_FALLBACK=0
 LINES=0
-if curl -s --max-time 120 "$URL" -o "$TMP"; then
-    LINES=$(wc -l < "$TMP")
-    echo "downloaded: $LINES lines"
-    if [ "$LINES" -ge "$IPLIST_MIN_LINES" ]; then
-        DOWNLOAD_OK=1
+SRC_DESC="$URL"   # описание источника для письма-сводки
+
+if [ "$IPLIST_CUSTOM_MODE" = only ]; then
+    # ----- only: интернет НЕ трогаем, наполняем ТОЛЬКО из локального файла -----
+    SRC_DESC="локальный файл $IPLIST_CUSTOM_FILE (режим only)"
+    echo "source: $SRC_DESC"
+    if [ -s "$IPLIST_CUSTOM_FILE" ]; then
+        LINES=$(wc -l < "$IPLIST_CUSTOM_FILE")
+        load_set_from_files "$IPLIST_CUSTOM_FILE" || \
+            mail_event iplist-fail 0 "BE7000: кастомный список без валидных подсетей" \
+"Режим 'only' (только локальный файл), но $IPLIST_CUSTOM_FILE не дал ни одной
+валидной подсети. Маршрутизация оставлена на ПРОШЛОМ списке iplist_set."
     else
-        echo "suspicious size ($LINES < $IPLIST_MIN_LINES) — reject"
+        echo "only-mode: нет/пуст $IPLIST_CUSTOM_FILE"
+        mail_event iplist-fail 0 "BE7000: кастомный список отсутствует" \
+"Режим 'only', но файла $IPLIST_CUSTOM_FILE нет или он пуст. Залей список через
+be7000 (Источник списка IP -> Кастомный локальный файл). Боевой set не тронут."
     fi
 else
-    echo "download failed"
-fi
+    # ----- скачиваем (как раньше); merge доклеит локальный файл поверх -----
+    echo "source: $URL"
+    DOWNLOAD_OK=0
+    if curl -s --max-time 120 "$URL" -o "$TMP"; then
+        LINES=$(wc -l < "$TMP")
+        echo "downloaded: $LINES lines"
+        if [ "$LINES" -ge "$IPLIST_MIN_LINES" ]; then
+            DOWNLOAD_OK=1
+        else
+            echo "suspicious size ($LINES < $IPLIST_MIN_LINES) — reject"
+        fi
+    else
+        echo "download failed"
+    fi
 
-# 2. Развилка по результату скачивания.
-USED_FALLBACK=0
-if [ "$DOWNLOAD_OK" = 1 ]; then
-    # Удачно: атомарно заливаем в боевой set и обновляем снимок для будущих ребутов.
-    load_set_from_file "$TMP"
-    cp "$TMP" "$SNAP_FILE" 2>/dev/null
-else
-    # Сбой источника. Решаем по состоянию боевого set:
-    CUR=$(ipset list "$SET" 2>/dev/null | awk '/^Number of entries:/{print $NF}')
-    case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
-    if [ "$CUR" -gt 0 ]; then
-        # set наполнен (обычный суточный апдейт при мёртвом источнике) — НЕ трогаем.
-        echo "keep existing set ($CUR entries)"
-        mail_event iplist-fail 0 "BE7000: НЕ обновился список IP" \
+    HAVE_CUSTOM=0
+    [ "$IPLIST_CUSTOM_MODE" = merge ] && [ -s "$IPLIST_CUSTOM_FILE" ] && HAVE_CUSTOM=1
+
+    if [ "$DOWNLOAD_OK" = 1 ]; then
+        # Удачно. merge → скачанное + локальный файл; иначе только скачанное.
+        if [ "$HAVE_CUSTOM" = 1 ]; then
+            SRC_DESC="$URL + локальный файл $IPLIST_CUSTOM_FILE (режим merge)"
+            load_set_from_files "$TMP" "$IPLIST_CUSTOM_FILE"
+        else
+            load_set_from_files "$TMP"
+        fi
+        cp "$TMP" "$SNAP_FILE" 2>/dev/null   # снимок = ТОЛЬКО скачанная часть (на boot домержим custom)
+    else
+        # Сбой источника. Решаем по состоянию боевого set:
+        CUR=$(ipset list "$SET" 2>/dev/null | awk '/^Number of entries:/{print $NF}')
+        case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
+        if [ "$CUR" -gt 0 ]; then
+            # set наполнен (обычный суточный апдейт при мёртвом источнике) — НЕ трогаем.
+            echo "keep existing set ($CUR entries)"
+            mail_event iplist-fail 0 "BE7000: НЕ обновился список IP" \
 "Не удалось обновить список IP-подсетей.
 Источник: $URL
 Маршрутизация работает на ПРОШЛОМ списке ($CUR подсетей) — ничего не
 сломалось, новых подсетей не добавилось. Если повторяется несколько
 дней — проверь доступность источника."
-        exit 1
-    elif [ -s "$SNAP_FILE" ]; then
-        # set пуст (типично после ребута при мёртвом источнике) — поднимаем из снимка.
-        echo "set empty — loading fallback snapshot $SNAP_FILE"
-        load_set_from_file "$SNAP_FILE"
-        USED_FALLBACK=1
-    else
-        # set пуст и снимка нет — сделать нечего, оставляем пустым (как было до фолбэка).
-        echo "set empty and no snapshot — nothing to load"
-        mail_event iplist-fail 0 "BE7000: список IP пуст" \
+            exit 1
+        elif [ -s "$SNAP_FILE" ] || [ "$HAVE_CUSTOM" = 1 ]; then
+            # set пуст (типично после ребута при мёртвом источнике) — поднимаем из
+            # снимка (+ локальный файл в merge). Custom — встроенная страховка на boot.
+            if [ "$HAVE_CUSTOM" = 1 ]; then
+                echo "set empty — loading fallback (snapshot + custom)"
+                load_set_from_files "$SNAP_FILE" "$IPLIST_CUSTOM_FILE"
+            else
+                echo "set empty — loading fallback snapshot $SNAP_FILE"
+                load_set_from_files "$SNAP_FILE"
+            fi
+            USED_FALLBACK=1
+        else
+            # set пуст и снимка нет — сделать нечего, оставляем пустым (как было до фолбэка).
+            echo "set empty and no snapshot — nothing to load"
+            mail_event iplist-fail 0 "BE7000: список IP пуст" \
 "Источник недоступен, локального снимка ещё нет — ipset iplist_set пуст.
 Источник: $URL
 Рунет и домены (awg_list) работают, но CDN-подсети из CIDR временно НЕ
 заворачиваются в VPN. Наполнится при следующем удачном обновлении
 (ближайший ребут или 5:00)."
-        exit 1
+            exit 1
+        fi
     fi
 fi
 
@@ -191,7 +255,8 @@ if [ "$NOTIFY" = 1 ]; then
 "Утреннее обновление списка IP-подсетей." \
 "" \
 "Подсетей в iplist_set: $COUNT ($delta)." \
-"Скачано строк с источника: $LINES." \
+"Источник: $SRC_DESC." \
+"Строк с источника: $LINES." \
 "" \
 "VPN: $vpn_state." \
 "Активный конфиг: ${active:-?}." \

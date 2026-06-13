@@ -12,7 +12,7 @@
 #             см. историю инцидента). Сайты из списка на это время
 #             недоступны. Шлёт письмо через notify.sh.
 #
-#   FAILOPEN → NORMAL   (VPS ожил): возвращает VPN-роутинг (split-route.sh)
+#   FAILOPEN → NORMAL   (VPS ожил): возвращает VPN-роутинг (mark-core + transport-awg)
 #             и DNS-upstream обратно в туннель. Шлёт письмо.
 #
 # АВТО-FAILOVER (июнь 2026). Детекцию падения НЕ меняем (те же HS_DEAD/HS_ALIVE);
@@ -69,9 +69,26 @@ FAILBACK_INTERVAL=${FAILBACK_INTERVAL:-900}    # как часто (сек) пр
 # эпизоде аварии. cross-эскалация не прыгает в протокол, который уже пробовали →
 # терминал всегда safety_off, без флаппинга. Чистится, когда транспорт снова здоров.
 FAILOVER_EPISODE=/tmp/awg-failover-episode
-TRANSPORT_HOME_FILE="$AWG_DIR/.transport-home"  # awg|xray — предпочитаемый транспорт (ручной выбор в меню); пусто → авто-возврат транспорта выключен
-XT="$AWG_DIR/xray-transport.sh"                 # транспорт-скрипт (cross-эскалация и home-возврат)
-XSTATE=/tmp/awg-watchdog.xstate                 # состояние xray-мониторинга: HEALTHY/SUSPECT/FAILED
+TRANSPORT_HOME_FILE="$AWG_DIR/.transport-home"  # awg|xray|hy2 — предпочитаемый транспорт (ручной выбор в меню); пусто → авто-возврат транспорта выключен
+XT_AWG="$AWG_DIR/transport-awg.sh"              # плагин awg-несущей (возврат awg-роутинга вместо split-route)
+MARK_CORE="$AWG_DIR/mark-core.sh"               # ядро маркировки (транспорт-агностично; было в split-route)
+TRANSPORT_SH="$AWG_DIR/transport.sh"            # ОРКЕСТРАТОР: switch/up/down/health/failover/next — ВСЯ работа с tunnel-транспортами идёт через него (имя файла плагина знает только он)
+XSTATE=/tmp/awg-watchdog.xstate                 # состояние мониторинга tunnel-транспорта (xray/hy2/…): HEALTHY/SUSPECT/FAILED
+
+# Вернуть ТОЛЬКО маркировку (mark-core), без несущей. Используется restore_awg_carrier
+# (возврат awg при оживании VPS). Cross/home-переключения транспортов идут через
+# transport.sh switch (тот сам кладёт mark-core). Зеркало бывшего split-route.sh, очищенного
+# от awg0-несущей. Фолбэк на split-route — для старых роутеров без mark-core.
+restore_marking() {
+    if [ -x "$MARK_CORE" ]; then sh "$MARK_CORE" >>"$LOG" 2>&1
+    elif [ -x "$AWG_DIR/split-route.sh" ]; then sh "$AWG_DIR/split-route.sh" >>"$LOG" 2>&1; fi
+}
+# Вернуть awg-несущую целиком (mark-core + transport-awg.sh up): default dev awg0 + FORWARD +
+# MASQUERADE + туннельный DNS + .transport=awg. Замена split-route.sh для «awg снова активен».
+restore_awg_carrier() {
+    restore_marking
+    if [ -x "$XT_AWG" ]; then sh "$XT_AWG" up >>"$LOG" 2>&1; fi
+}
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG"; }
 
@@ -107,43 +124,59 @@ episode_has() { [ -f "$FAILOVER_EPISODE" ] && grep -qw "$1" "$FAILOVER_EPISODE" 
 episode_add() { episode_has "$1" || echo "$1" >> "$FAILOVER_EPISODE"; }
 episode_reset() { : > "$FAILOVER_EPISODE"; }
 
-# Предпочитаемый («домашний») транспорт: awg|xray. ПУСТО (нет файла) → авто-возврат
+# Предпочитаемый («домашний») транспорт: awg|xray|hy2. ПУСТО (нет файла) → авто-возврат
 # транспорта выключен (пишется только ручным выбором в меню be7000.ps1 — авто-cross
 # его НЕ трогает, иначе «дом» уехал бы за аварийным переключением).
 transport_home() { cat "$TRANSPORT_HOME_FILE" 2>/dev/null | tr -d ' \t\r\n'; }
 
-# Пригоден ли xray для эскалации: скрипт есть + выбран активный конфиг (его JSON есть).
-have_xray() {
-    [ -x "$XT" ] || return 1
-    xa=$(cat "$AWG_DIR/.xray-active" 2>/dev/null)
-    [ -n "$xa" ] && [ -f "$AWG_DIR/xray-configs/$xa.json" ]
+# Человекочитаемое имя транспорта для писем (под hy2 добавится строка). Generic-замена
+# хардкоду «Xray» — теперь ветка обслуживает любой tunnel-транспорт.
+transport_label() {
+    case "$1" in
+        awg)  echo "AmneziaWG" ;;
+        xray) echo "Xray" ;;
+        hy2)  echo "Hysteria2" ;;
+        *)    echo "$1" ;;
+    esac
 }
+# Готов ли транспорт <name> к подъёму — спрашиваем ОРКЕСТРАТОР (его реестр + проверка
+# плагина/секрет-конфига). Watchdog не знает имён файлов плагинов, только имена транспортов.
+transport_ready() { sh "$TRANSPORT_SH" list 2>/dev/null | grep -qw "$1"; }
+# Следующий готовый НЕ-awg транспорт для cross с awg (xray/hy2/… по реестру). Пусто → некуда.
+cross_target_from_awg() { sh "$TRANSPORT_SH" next awg 2>/dev/null; }
 
-# Эскалация awg→xray (вариант A). Зовётся, когда awg-пул исчерпан и система уже в
-# safety_off (прямой = SAFE-пол). Возвращает маркировку (safety_off её снял), поднимает
-# xray, при нужде перебирает xray-пул. 0 — встали на xray; 1 — xray тоже мёртв (прямой).
-# Анти-петля: не лезет в xray, если он уже пробован в этом эпизоде.
-cross_awg_to_xray() {
+# Установлен ли AmneziaWG (есть секрет-конфиг). В xray-only awg НЕТ — cross на него
+# невозможен (нет awg0/awg.conf), эскалация вырождается в прямой режим. Зеркало
+# HAVE_AWG установщика и have_awg из xray-transport.sh.
+have_awg() { [ -f "$AWG_DIR/awg.conf" ]; }
+
+# Эскалация awg→другой транспорт (вариант A). Зовётся, когда awg-пул исчерпан и система
+# уже в safety_off (прямой = SAFE-пол). Цель выбирает ОРКЕСТРАТОР (transport.sh next awg —
+# первый готовый не-awg по реестру, обычно xray/hy2). Возвращает маркировку (safety_off её
+# снял), поднимает цель, при нужде перебирает её пул. 0 — встали; 1 — цель тоже мёртва
+# (прямой). Анти-петля: не лезет в транспорт, уже пробованный в этом эпизоде.
+cross_awg_to_other() {
     [ "$(fo_escalate)" = "cross" ] || return 1
-    episode_has xray && return 1
-    have_xray || return 1
-    episode_add xray
-    log "awg-пул исчерпан → cross: пробую Xray"
-    [ -x "$AWG_DIR/split-route.sh" ] && sh "$AWG_DIR/split-route.sh" >>"$LOG" 2>&1   # safety_off снял fwmark/mangle — вернуть
-    sh "$XT" up >>"$LOG" 2>&1
-    if sh "$XT" health >/dev/null 2>&1 || sh "$XT" failover >>"$LOG" 2>&1; then
+    other=$(cross_target_from_awg)
+    [ -n "$other" ] || return 1
+    episode_has "$other" && return 1
+    episode_add "$other"
+    olbl=$(transport_label "$other")
+    log "awg-пул исчерпан → cross: пробую $other"
+    sh "$TRANSPORT_SH" switch "$other" >>"$LOG" 2>&1   # оркестратор: релинквиш awg + mark-core + подъём $other
+    if sh "$TRANSPORT_SH" health "$other" >/dev/null 2>&1 || sh "$TRANSPORT_SH" failover "$other" >>"$LOG" 2>&1; then
         echo NORMAL > "$STATE"; echo HEALTHY > "$XSTATE"
         ip=$(ext_ip)
-        notify "BE7000: AmneziaWG упал -> перешли на Xray" \
-"Все awg-серверы недоступны. Роутер автоматически переключился на Xray
-(конфиг $(cat "$AWG_DIR/.xray-active" 2>/dev/null)). Внешний IP: ${ip:-неизвестен}.
+        notify "BE7000: AmneziaWG упал -> перешли на $olbl" \
+"Все awg-серверы недоступны. Роутер автоматически переключился на $olbl.
+Внешний IP: ${ip:-неизвестен}.
 Вернуться на AmneziaWG: be7000 меню -> Протокол."
         return 0
     fi
-    sh "$XT" down >>"$LOG" 2>&1
+    sh "$TRANSPORT_SH" down "$other" >>"$LOG" 2>&1
     [ -x "$SWITCH_VPN" ] && sh "$SWITCH_VPN" safety-off >>"$LOG" 2>&1
     echo FAILOPEN > "$STATE"; echo FAILED > "$XSTATE"
-    log "cross: Xray тоже недоступен → прямой режим"
+    log "cross: $other тоже недоступен → прямой режим"
     return 1
 }
 
@@ -197,22 +230,27 @@ command -v wg >/dev/null 2>&1 && WG=wg
 : > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT INT TERM HUP
 
-# Транспорт-aware. При .transport=xray awg-логику НЕ применяем (иначе watchdog зря
-# гонял бы awg-failover, видя «старый» handshake awg0-резерва). Лестница на сбой xray
-# (НЕ цикл — каждый протокол перебираем ≤1 раза за эпизод, терминал = safety_off):
-#   off            → вернуться на AmneziaWG (как раньше).
-#   sticky/home    → перебор xray-резервов (xray-transport.sh failover); исчерпан →
-#                    по .failover-escalate: cross → AmneziaWG + перебор awg-резервов
-#                    (анти-петля через episode-гард), direct → прямой режим.
+# Транспорт-aware. При активном TUNNEL-транспорте (.transport != awg: xray/hy2/…) awg-логику
+# НЕ применяем (иначе watchdog зря гонял бы awg-failover, видя «старый» handshake awg0-резерва).
+# ВСЯ работа с tunnel-транспортом идёт через ОРКЕСТРАТОР (transport.sh health/failover/switch/
+# down/next) — имя файла плагина знает только он, поэтому ветка generic и hysteria2 станет
+# drop-in (без правок watchdog). Лестница на сбой (НЕ цикл — каждый протокол ≤1 раза за эпизод,
+# терминал = safety_off):
+#   off            → вернуться на AmneziaWG (если установлен), иначе прямой режим.
+#   sticky/home    → перебор резервов транспорта (transport.sh failover); исчерпан →
+#                    по .failover-escalate: cross → следующий готовый транспорт (transport.sh
+#                    next, обычно awg) + его перебор (анти-петля через episode-гард),
+#                    direct → прямой режим.
 # Анти-дребезг: первая осечка health = SUSPECT (без действий), реакция со 2-го тика.
-# После фолбэка .transport=awg → следующий тик идёт обычной awg-веткой.
-TRANSPORT=$(cat "$AWG_DIR/.transport" 2>/dev/null)
-if [ "$TRANSPORT" = "xray" ] && [ -x "$XT" ]; then
+# После фолбэка на awg .transport=awg → следующий тик идёт обычной awg-веткой.
+TRANSPORT=$(cat "$AWG_DIR/.transport" 2>/dev/null | tr -d ' \r\n')
+if [ -n "$TRANSPORT" ] && [ "$TRANSPORT" != "awg" ] && [ -x "$TRANSPORT_SH" ]; then
+    TLABEL=$(transport_label "$TRANSPORT")
     xcur=HEALTHY; [ -f "$XSTATE" ] && xcur=$(cat "$XSTATE")
 
-    if sh "$XT" health >>"$LOG" 2>&1; then
-        if [ "$xcur" != "HEALTHY" ]; then echo HEALTHY > "$XSTATE"; episode_reset; log "xray health: ок"; fi
-        # A: домашний транспорт = awg, а мы на xray (после cross) → вернуться на awg,
+    if sh "$TRANSPORT_SH" health "$TRANSPORT" >>"$LOG" 2>&1; then
+        if [ "$xcur" != "HEALTHY" ]; then echo HEALTHY > "$XSTATE"; episode_reset; log "$TRANSPORT health: ок"; fi
+        # A: домашний транспорт = awg, а мы на tunnel (после cross) → вернуться на awg,
         # когда awg0 снова жив (он держит handshake тёплым резервом). Только mode=home,
         # троттл FAILBACK_INTERVAL. transport_home пуст → не трогаем (юзер не задавал).
         if [ "$(fo_mode)" = "home" ] && [ "$(transport_home)" = "awg" ] \
@@ -222,7 +260,7 @@ if [ "$TRANSPORT" = "xray" ] && [ -x "$XT" ]; then
             if [ "$ahs" -gt 0 ] && [ $(( $(date +%s) - ahs )) -le "$HS_ALIVE" ]; then
                 date +%s > "$FAILBACK_STAMP"
                 log "home-transport: awg жив → возврат на AmneziaWG"
-                sh "$XT" down >>"$LOG" 2>&1
+                sh "$TRANSPORT_SH" switch awg >>"$LOG" 2>&1   # релинквиш tunnel + подъём awg-несущей
             fi
         fi
         exit 0
@@ -233,70 +271,99 @@ if [ "$TRANSPORT" = "xray" ] && [ -x "$XT" ]; then
     # начало нового эпизода аварии — сбрасываем episode-гард.
     if [ "$xcur" = "HEALTHY" ]; then
         echo SUSPECT > "$XSTATE"; episode_reset
-        log "xray health: осечка (жду подтверждения на следующем тике)"
+        log "$TRANSPORT health: осечка (жду подтверждения на следующем тике)"
         exit 0
     fi
 
     mode=$(fo_mode)
-    episode_add xray
-    log "xray health: подтверждённый сбой (режим=$mode)"
+    episode_add "$TRANSPORT"
+    log "$TRANSPORT health: подтверждённый сбой (режим=$mode)"
 
     if [ "$mode" = "off" ]; then
-        log "xray режим=off → фолбэк на AmneziaWG"
-        sh "$XT" down >>"$LOG" 2>&1
-        echo FAILED > "$XSTATE"
-        ip=$(ext_ip)
-        notify "BE7000: Xray упал -> вернулись на AmneziaWG" \
-"Xray не прошёл проверку здоровья (демон/туннель/проба egress).
+        if have_awg; then
+            log "$TRANSPORT режим=off → фолбэк на AmneziaWG"
+            sh "$TRANSPORT_SH" switch awg >>"$LOG" 2>&1   # релинквиш tunnel + подъём awg-несущей + .transport=awg
+            echo FAILED > "$XSTATE"
+            ip=$(ext_ip)
+            notify "BE7000: $TLABEL упал -> вернулись на AmneziaWG" \
+"$TLABEL не прошёл проверку здоровья (демон/туннель/проба egress).
 Авто-failover выключен (режим off) — роутер вернулся на AmneziaWG (awg0).
 Внешний IP сейчас: ${ip:-неизвестен}.
-Снова включить Xray: be7000 меню -> Протокол."
-        exit 0
-    fi
-
-    # sticky/home → перебор xray-резервов
-    log "→ перебор xray-резервов"
-    if sh "$XT" failover >>"$LOG" 2>&1; then
-        echo HEALTHY > "$XSTATE"
-        log "xray-failover: встали на резервный xray-сервер"
-        exit 0
-    fi
-
-    # xray-пул исчерпан → эскалация
-    esc=$(fo_escalate)
-    if [ "$esc" = "cross" ] && ! episode_has awg; then
-        episode_add awg
-        log "xray-пул исчерпан → cross: переключаюсь на AmneziaWG"
-        sh "$XT" down >>"$LOG" 2>&1   # down вернул awg0 на текущий (default) конфиг
-        # Сначала проверим, ЖИВ ли текущий awg-сервер (awg0 держит handshake даже как
-        # тёплый резерв). Жив → остаёмся на нём; НЕЗАЧЕМ звать do_failover, который
-        # пропускает текущий по имени и зря ушёл бы на резерв, бросив рабочий default.
-        ahs=$($WG show awg0 latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
-        case "$ahs" in ''|*[!0-9]*) ahs=0 ;; esac
-        if [ "$ahs" -gt 0 ] && [ $(( $(date +%s) - ahs )) -le "$HS_DEAD" ]; then
-            echo "NORMAL" > "$STATE"; echo HEALTHY > "$XSTATE"
-            log "cross: awg ($(cat "$ACTIVE_NAME" 2>/dev/null)) жив — остаёмся на нём"
-        elif [ -x "$SWITCH_VPN" ] && sh "$SWITCH_VPN" failover >>"$LOG" 2>&1; then
-            echo "NORMAL" > "$STATE"; echo HEALTHY > "$XSTATE"
-            log "cross: текущий awg мёртв → встали на awg-резерв"
+Снова включить $TLABEL: be7000 меню -> Протокол."
         else
-            echo "FAILOPEN" > "$STATE"; echo FAILED > "$XSTATE"
-            log "cross: awg-резервы тоже недоступны → прямой режим"
+            # tunnel-only: возвращаться на awg НЕКУДА → прямой режим. Уведомляем ОДИН раз
+            # (на переходе xcur!=FAILED): .transport остаётся прежним, иначе ветка крутила
+            # бы down+письмо каждый тик. down в tunnel-only сам уводит в прямой (set_direct_dns).
+            if [ "$xcur" != FAILED ]; then
+                log "$TRANSPORT режим=off, awg не установлен → прямой режим (fail-open)"
+                sh "$TRANSPORT_SH" down "$TRANSPORT" >>"$LOG" 2>&1
+                echo FAILED > "$XSTATE"
+                ip=$(ext_ip)
+                notify "BE7000: $TLABEL упал -> прямой режим" \
+"$TLABEL не прошёл проверку здоровья (демон/туннель/проба egress).
+Авто-failover выключен (режим off), AmneziaWG не установлен — роутер в ПРЯМОМ
+режиме: интернет/DNS работают мимо VPN, сайты из списка недоступны.
+Внешний IP сейчас: ${ip:-неизвестен}.
+Снова поднять $TLABEL: be7000 меню -> Протокол."
+            fi
         fi
         exit 0
     fi
 
-    # direct, либо cross но awg уже пробовали в этом эпизоде (анти-петля) → прямой режим
-    log "xray-пул исчерпан → прямой режим (escalate=$esc)"
-    sh "$XT" down >>"$LOG" 2>&1
-    [ -x "$SWITCH_VPN" ] && sh "$SWITCH_VPN" safety-off >>"$LOG" 2>&1
-    echo "FAILOPEN" > "$STATE"; echo FAILED > "$XSTATE"
-    ip=$(ext_ip)
-    notify "BE7000: Xray и резервы недоступны -> прямой режим" \
-"Xray упал, и ни один xray-резерв не поднялся. Роутер в ПРЯМОМ режиме
+    # sticky/home → перебор резервов транспорта (внутри плагина: xray-configs/*.json и т.п.)
+    log "→ перебор резервов $TRANSPORT"
+    if sh "$TRANSPORT_SH" failover "$TRANSPORT" >>"$LOG" 2>&1; then
+        echo HEALTHY > "$XSTATE"
+        log "$TRANSPORT-failover: встали на резервный сервер"
+        exit 0
+    fi
+
+    # Пул транспорта исчерпан → эскалация. cross → следующий готовый транспорт по реестру
+    # (transport.sh next, обычно awg — он первый; в tunnel-only его нет → cross_target пуст
+    # → прямой режим, без попыток поднять отсутствующий awg0).
+    esc=$(fo_escalate)
+    other=$(sh "$TRANSPORT_SH" next "$TRANSPORT")
+    if [ "$esc" = "cross" ] && [ -n "$other" ] && ! episode_has "$other"; then
+        episode_add "$other"
+        log "$TRANSPORT-пул исчерпан → cross: переключаюсь на $other"
+        sh "$TRANSPORT_SH" switch "$other" >>"$LOG" 2>&1   # релинквиш tunnel + подъём несущей $other (switch уже записал .transport)
+        # Несущая $other поднята; здоровье — через контракт плагина. Жив → остаёмся.
+        if sh "$TRANSPORT_SH" health "$other" >/dev/null 2>&1; then
+            echo "NORMAL" > "$STATE"; echo HEALTHY > "$XSTATE"
+            log "cross: $other жив — остаёмся на нём"
+        elif [ "$other" = "awg" ] && [ -x "$SWITCH_VPN" ] && sh "$SWITCH_VPN" failover >>"$LOG" 2>&1; then
+            # awg: текущий default-конфиг мёртв → перебор awg-резервов (единый бэкенд switch-vpn;
+            # do_failover здесь НЕзачем — он пропустил бы рабочий default по имени).
+            echo "NORMAL" > "$STATE"; echo HEALTHY > "$XSTATE"
+            log "cross: текущий awg мёртв → встали на awg-резерв"
+        elif [ "$other" != "awg" ] && sh "$TRANSPORT_SH" failover "$other" >>"$LOG" 2>&1; then
+            # tunnel-цель (hy2/…): перебор её собственных резервов
+            echo "NORMAL" > "$STATE"; echo HEALTHY > "$XSTATE"
+            log "cross: перебор резервов $other — встали"
+        else
+            echo "FAILOPEN" > "$STATE"; echo FAILED > "$XSTATE"
+            log "cross: $other тоже недоступен → прямой режим"
+        fi
+        exit 0
+    fi
+
+    # direct, либо cross но цель уже пробована/отсутствует (анти-петля) → прямой режим.
+    # Действуем и уведомляем ТОЛЬКО на переходе (xcur != FAILED): иначе при стойком сбое
+    # (tunnel-only / исчерпанный cross) эта ветка крутилась бы каждый тик = спам.
+    if [ "$xcur" != FAILED ]; then
+        log "$TRANSPORT-пул исчерпан → прямой режим (escalate=$esc)"
+        sh "$TRANSPORT_SH" down "$TRANSPORT" >>"$LOG" 2>&1
+        [ -x "$SWITCH_VPN" ] && sh "$SWITCH_VPN" safety-off >>"$LOG" 2>&1
+        echo "FAILOPEN" > "$STATE"; echo FAILED > "$XSTATE"
+        ip=$(ext_ip)
+        notify "BE7000: $TLABEL и резервы недоступны -> прямой режим" \
+"$TLABEL упал, и ни один его резерв не поднялся. Роутер в ПРЯМОМ режиме
 (safety_off): интернет/DNS работают мимо VPN, сайты из списка недоступны.
 Внешний IP сейчас: ${ip:-неизвестен}.
-Вернуть Xray вручную: be7000 меню -> Протокол."
+Вернуть VPN вручную: be7000 меню -> Протокол."
+    else
+        log "$TRANSPORT-пул исчерпан, уже FAILOPEN/FAILED — без изменений (escalate=$esc)"
+    fi
     exit 0
 fi
 
@@ -322,17 +389,17 @@ if [ "$age" -ge "$HS_DEAD" ]; then
         episode_reset; episode_add awg; date +%s > "$FAILOVER_STAMP"
         if [ "$mode" != "off" ] && [ "$nbk" -ge 1 ] && [ -x "$SWITCH_VPN" ]; then
             # есть awg-резервы → перебор (письма шлёт switch-vpn); awg-пул исчерпан →
-            # cross на Xray (вариант A), иначе остаёмся в прямом режиме.
+            # cross на другой транспорт (вариант A), иначе остаёмся в прямом режиме.
             log "VPS МЁРТВ (handshake ${age}с) → failover (режим=$mode, резервов=$nbk)"
-            run_failover || cross_awg_to_xray
-        elif [ "$mode" != "off" ] && [ "$(fo_escalate)" = "cross" ] && have_xray; then
-            # failover включён, awg-резервов нет → сразу cross на Xray (A)
-            log "VPS МЁРТВ (handshake ${age}с), awg-резервов нет → cross на Xray"
+            run_failover || cross_awg_to_other
+        elif [ "$mode" != "off" ] && [ "$(fo_escalate)" = "cross" ] && [ -n "$(cross_target_from_awg)" ]; then
+            # failover включён, awg-резервов нет → сразу cross на другой транспорт (A)
+            log "VPS МЁРТВ (handshake ${age}с), awg-резервов нет → cross на другой транспорт"
             [ -x "$SWITCH_VPN" ] && sh "$SWITCH_VPN" safety-off >>"$LOG" 2>&1
             echo "FAILOPEN" > "$STATE"
-            cross_awg_to_xray
+            cross_awg_to_other
         else
-            # режим off, либо нет ни awg-резервов, ни xray — классический fail-open
+            # режим off, либо нет ни awg-резервов, ни другого транспорта — классический fail-open
             log "VPS МЁРТВ (handshake ${age}с) → прямой режим (режим=$mode, резервов=$nbk)"
             [ -x "$SWITCH_VPN" ] && sh "$SWITCH_VPN" safety-off >>"$LOG" 2>&1
             echo "FAILOPEN" > "$STATE"
@@ -352,15 +419,15 @@ if [ "$age" -ge "$HS_DEAD" ]; then
         fi
     else
         # --- уже FAILOPEN: периодически (троттл) пробуем восстановиться заново ---
-        # Каждый ретрай = свежая попытка ВСЕЙ лестницы (awg-пул + cross на xray):
+        # Каждый ретрай = свежая попытка ВСЕЙ лестницы (awg-пул + cross на другой транспорт):
         # сбрасываем эпизод-гард, вдруг что-то ожило. Без флаппинга — раз в FAILOVER_RETRY.
         if [ "$mode" != "off" ] && [ "$(stamp_age "$FAILOVER_STAMP")" -ge "$FAILOVER_RETRY" ]; then
             date +%s > "$FAILOVER_STAMP"; episode_reset; episode_add awg
             log "VPS всё ещё мёртв (${age}с), FAILOPEN → повторная попытка восстановления"
             if [ "$nbk" -ge 1 ] && [ -x "$SWITCH_VPN" ]; then
-                run_failover || cross_awg_to_xray
+                run_failover || cross_awg_to_other
             else
-                cross_awg_to_xray
+                cross_awg_to_other
             fi
         else
             log "VPS всё ещё мёртв (${age}с), уже FAILOPEN — без изменений"
@@ -370,8 +437,9 @@ elif [ "$age" -le "$HS_ALIVE" ]; then
     # ===== VPS жив =====
     if [ "$cur" = "FAILOPEN" ]; then
         log "VPS ОЖИЛ (handshake ${age}с назад) → возврат VPN"
-        # 1) маршрутизация обратно через awg0
-        [ -x "$AWG_DIR/split-route.sh" ] && sh "$AWG_DIR/split-route.sh" >>"$LOG" 2>&1
+        # 1) awg-несущая обратно: mark-core + transport-awg.sh up (default dev awg0 +
+        #    FORWARD + MASQUERADE + туннельный DNS). Замена ретайрнутого split-route.sh.
+        restore_awg_carrier
         # 2) DNS-upstream обратно в туннель (как awg-heal/awg-setup)
         VPN_DNS=$(grep -E '^DNS\s*=' "$AWG_DIR/awg.conf" 2>/dev/null | head -1 | awk -F'= *' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
         [ -z "$VPN_DNS" ] && VPN_DNS=172.29.172.254
@@ -393,21 +461,22 @@ elif [ "$age" -le "$HS_ALIVE" ]; then
         # откатится на текущий резерв). ICMP-проба — чтобы не дёргать рабочий
         # туннель впустую; если VPS блокирует ICMP, авто-возврат не сработает —
         # вернуться можно вручную (меню 9).
-        if [ "$(fo_mode)" = "home" ] && [ "$(transport_home)" = "xray" ] && have_xray \
+        home_t=$(transport_home)
+        if [ "$(fo_mode)" = "home" ] && [ -n "$home_t" ] && [ "$home_t" != "awg" ] && transport_ready "$home_t" \
            && [ "$(stamp_age "$FAILBACK_STAMP")" -ge "$FAILBACK_INTERVAL" ]; then
-            # ===== home-транспорт = xray, а мы на awg (после cross) → вернуться на xray =====
-            # Reality-сервер НЕ отвечает на ICMP и неотличим по TCP (маскируется под HTTPS)
-            # → «ожил ли он» надёжно проверяется ТОЛЬКО подъёмом xray + egress-пробой.
+            # ===== home-транспорт = tunnel (xray/hy2), а мы на awg (после cross) → вернуться на него =====
+            # Reality/маскирующиеся туннели НЕ отвечают на ICMP и неотличимы по TCP (под HTTPS)
+            # → «ожил ли сервер» надёжно проверяется ТОЛЬКО подъёмом транспорта + egress-пробой.
             # Делаем редко (FAILBACK_INTERVAL) и откатываемся на awg, если не встал. Это
-            # opt-in (mode=home): краткая просадка раз в интервал, пока домашний xray мёртв.
+            # opt-in (mode=home): краткая просадка раз в интервал, пока домашний транспорт мёртв.
+            home_lbl=$(transport_label "$home_t")
             date +%s > "$FAILBACK_STAMP"
-            log "home-transport: проба возврата на домашний Xray (подъём + egress-проба)"
-            [ -x "$AWG_DIR/split-route.sh" ] && sh "$AWG_DIR/split-route.sh" >>"$LOG" 2>&1
-            sh "$XT" up >>"$LOG" 2>&1
-            if sh "$XT" health >/dev/null 2>&1; then
-                echo HEALTHY > "$XSTATE"; log "home-transport: вернулись на Xray"
+            log "home-transport: проба возврата на домашний $home_lbl (подъём + egress-проба)"
+            sh "$TRANSPORT_SH" switch "$home_t" >>"$LOG" 2>&1   # оркестратор: релинквиш awg + mark-core + подъём $home_t
+            if sh "$TRANSPORT_SH" health "$home_t" >/dev/null 2>&1; then
+                echo HEALTHY > "$XSTATE"; log "home-transport: вернулись на $home_lbl"
             else
-                sh "$XT" down >>"$LOG" 2>&1; log "home-transport: xray ещё мёртв — остаёмся на awg"
+                sh "$TRANSPORT_SH" switch awg >>"$LOG" 2>&1; log "home-transport: $home_lbl ещё мёртв — остаёмся на awg"
             fi
         elif [ "$(fo_mode)" = "home" ]; then
             home=$(cat "$FAILOVER_HOME_FILE" 2>/dev/null)

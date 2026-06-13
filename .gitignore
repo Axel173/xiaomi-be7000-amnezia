@@ -11,3 +11,9 @@ notify.conf
 # Xray-секреты (vless-ключи внутри). hev.yaml/xray-transport.sh — НЕ секрет, в git.
 xray.json
 /xray-configs/
+# Hysteria2-секреты (auth/obfs-пароли внутри). transport-hy2.sh — НЕ секрет, в git.
+hysteria.yaml
+/hy2-configs/
+# Рабочая папка UPX-сжатия бинарей (сам upx + оригинал-бэкап amneziawg-go.user.orig).
+# Локальный инструментарий, не для репо; оригинал держим как fallback, если UPX сломает awg0.
+/.upxtmp/

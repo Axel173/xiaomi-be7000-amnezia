@@ -26,11 +26,16 @@
 
 param(
     [switch]$Install,   # форсировать ветку установки (в обход детекта)
-    [switch]$Manage     # форсировать меню управления (в обход детекта)
+    [switch]$Manage,    # форсировать меню управления (в обход детекта)
+    # Файлы, перетащенные мышью НА be7000.bat: .bat форвардит их в %*, Windows
+    # передаёт абсолютными путями -> ValueFromRemainingArguments собирает их сюда.
+    # Пусто при обычном запуске. Обрабатываются перед меню (мульти-заливка конфигов).
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$DropFiles
 )
 
 # Версия PC-стороны проекта. Бампать при заметных изменениях; см. CHANGELOG.md.
-$script:ProjectVersion = '0.2.0'
+$script:ProjectVersion = '0.3.0'
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -57,7 +62,10 @@ $REQUIRED_FILES = @(
     "switch-vpn.sh",
     "domain.sh",
     "awg-status.sh",
-    "iplist-update.sh"
+    "iplist-update.sh",
+    "mark-core.sh",
+    "transport-awg.sh",
+    "transport.sh"
 )
 $OPTIONAL_FILES = @(
     "vpn-toggle.sh",
@@ -70,6 +78,7 @@ $OPTIONAL_FILES = @(
     "apply-bypass.sh",
     "awg-dump.sh",
     "xray-transport.sh",
+    "transport-hy2.sh",
     "hev.yaml"
 )
 $BIN_FILES = @{
@@ -77,6 +86,7 @@ $BIN_FILES = @{
     "awg.user"          = "bin/awg.user"
     "xray.user"         = "bin/xray.user"
     "hev.user"          = "bin/hev.user"
+    "hysteria.user"     = "bin/hysteria.user"
 }
 
 # ============================================================
@@ -910,8 +920,24 @@ function Action-IncludeDstIP {
     else { Write-Err "Не получилось"; Write-Host ($out -join "`n") }
 }
 
+# awg-демон (amneziawg-go) реально стоит на роутере? Это несущая awg0. На hy2/xray-only
+# установке его НЕТ — тогда заливать/активировать awg-конфиги бессмысленно (switch-vpn
+# упрётся в гард awg_installed и вернёт код 1). Чтобы НЕ вводить юзера в заблуждение,
+# меню awg-конфигов сперва спрашивает это.
+function Test-AwgInstalled {
+    $r = "" + (Invoke-Router -Command "[ -x $AWG_DIR/amneziawg-go ] && echo AWG_YES || echo AWG_NO" -Silent)
+    return ($r -match 'AWG_YES')
+}
+
 function Action-SwitchCountry {
     Write-Section "Доступные конфиги (страны)"
+    if (-not (Test-AwgInstalled)) {
+        Write-Warn "AmneziaWG на роутере НЕ установлен (нет amneziawg-go) — переключать страны нечем."
+        Write-Host "Несущий транспорт сейчас не AmneziaWG; awg-конфиги без самого AmneziaWG не активируются." -ForegroundColor DarkGray
+        Write-Host "Поставить AmneziaWG: меню -> «Установка и обслуживание» -> Установить," -ForegroundColor DarkGray
+        Write-Host "выбрав вариант с AmneziaWG (напр. «AmneziaWG + Hysteria2»)." -ForegroundColor DarkGray
+        return
+    }
     $listOut = Invoke-Router -Command "ls -1 $AWG_DIR/configs/ 2>/dev/null | grep '\.conf$' | sed 's/\.conf$//'"
     if (-not $listOut) {
         Write-Warn "Папка $AWG_DIR/configs/ пуста. Положи туда germany.conf / france.conf и т.п."
@@ -943,6 +969,18 @@ function Action-UploadConfig {
     # оставил бы '\r' в Endpoint/ключах и сломал бы туннель. Поэтому нормализуем
     # переводы строк в LF ПЕРЕД отправкой — на роутер уходит чистый LF-файл.
     Write-Section "Залить конфиг (.conf) на роутер"
+    # Если awg-демона на роутере нет (hy2/xray-only установка) — конфиг можно залить
+    # про запас, но активировать его сейчас нечем. Предупреждаем явно, чтобы не
+    # повторялась ловушка «залил конфиг + сменил страну -> [FAIL] нечем активировать».
+    $awgInstalled = Test-AwgInstalled
+    if (-not $awgInstalled) {
+        Write-Warn "AmneziaWG на роутере НЕ установлен (нет amneziawg-go)."
+        Write-Host "Залить .conf можно, но активировать его будет нечем — awg-конфиги работают" -ForegroundColor DarkGray
+        Write-Host "только при установленном AmneziaWG (сейчас несущий транспорт другой: xray/hy2)." -ForegroundColor DarkGray
+        Write-Host "Поставить AmneziaWG: меню -> «Установка и обслуживание» -> Установить," -ForegroundColor DarkGray
+        Write-Host "выбрав вариант с AmneziaWG (напр. «AmneziaWG + Hysteria2»)." -ForegroundColor DarkGray
+        if (-not (_Confirm "Всё равно залить awg-конфиг про запас (активировать сейчас нельзя)?")) { Write-Warn "Отмена"; return }
+    }
     Write-Host "Путь к локальному .conf (можно перетащить файл в это окно)." -ForegroundColor DarkGray
 
     $raw = Read-Host "Путь к файлу"
@@ -1011,14 +1049,86 @@ function Action-UploadConfig {
     $bytes = if ("$out" -match 'SAVED\s+(\d+)') { $matches[1] } else { '?' }
     Write-Ok "Готово: $dst (записано $bytes байт)"
 
-    # Сразу предложим активировать (как «Сменить страну/конфиг»), без отдельного захода.
-    if (_Confirm "Сделать '$base' активным конфигом сейчас?") {
-        $sw = "if command -v vpn >/dev/null 2>&1; then vpn $base; else sh $AWG_DIR/switch-vpn.sh $base; fi"
-        $r = Invoke-Router -Command $sw
-        Write-Host ($r -join "`n")
+    # Активировать предлагаем ТОЛЬКО если awg-демон реально стоит — иначе switch-vpn
+    # упрётся в гард и вернёт [FAIL]. Без awg конфиг просто лежит про запас.
+    if ($awgInstalled) {
+        if (_Confirm "Сделать '$base' активным конфигом сейчас?") {
+            $sw = "if command -v vpn >/dev/null 2>&1; then vpn $base; else sh $AWG_DIR/switch-vpn.sh $base; fi"
+            $r = Invoke-Router -Command $sw
+            Write-Host ($r -join "`n")
+        } else {
+            Write-Host "Переключиться можно позже: «Серверы AmneziaWG» -> Сменить страну/конфиг." -ForegroundColor DarkGray
+        }
     } else {
-        Write-Host "Переключиться можно позже: «Страна и серверы» -> Сменить страну/конфиг." -ForegroundColor DarkGray
+        Write-Host "Конфиг сохранён про запас. Он станет рабочим после установки AmneziaWG" -ForegroundColor DarkGray
+        Write-Host "(меню -> «Установка и обслуживание» -> Установить, вариант с AmneziaWG)." -ForegroundColor DarkGray
     }
+}
+
+# Мульти-заливка: пути к конфигам, перетащенные мышью НА be7000.bat (или переданные
+# аргументами), раскладываются по типам и льются на роутер без диалога per-файл.
+# Тип берём по РАСШИРЕНИЮ (предсказуемо), содержимое — лишь для мягкого предупреждения:
+#   *.conf       -> awg-конфиг страны -> configs/<имя>.conf
+#   *.json       -> xray-конфиг       -> xray-configs/<имя>.json
+#   *.yaml/*.yml -> hy2-конфиг         -> hy2-configs/<имя>.yaml
+# Активным НЕ делает (конфигов много — какой активировать, юзер решит в меню потом).
+function Action-IngestDroppedConfigs {
+    param([string[]]$Paths)
+    Write-Section "Мульти-заливка конфигов (перетащено: $(@($Paths).Count))"
+
+    # 1) Разбираем входные пути -> список items {Kind, Local, Name, Dir, RemoteExt, Text}.
+    $items = @()
+    foreach ($raw in @($Paths)) {
+        if (-not $raw) { continue }
+        $p = ("" + $raw).Trim().Trim('"')
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { Write-Warn "Пропуск (не файл): $p"; continue }
+        $p = (Resolve-Path -LiteralPath $p).Path
+        $leaf = Split-Path $p -Leaf
+        $base = ([System.IO.Path]::GetFileNameWithoutExtension($p)) -replace '[^A-Za-z0-9._-]', '-'
+        if (-not $base) { Write-Warn "Пропуск (пустое имя): $leaf"; continue }
+        # ReadAllText (не Get-Content -Raw): тот на ру-Windows без BOM читает в CP1251
+        # и портит кириллицу. Конфиги обычно ASCII, но читаем явно и безопасно.
+        try   { $text = [System.IO.File]::ReadAllText($p) }
+        catch { Write-Warn "Пропуск (не прочитать): $leaf"; continue }
+
+        $ext = [System.IO.Path]::GetExtension($p).ToLower()
+        $kind = $null; $dir = $null; $remoteExt = $null
+        if     ($ext -eq '.conf')                      { $kind = 'awg';  $dir = "$AWG_DIR/configs";      $remoteExt = '.conf' }
+        elseif ($ext -eq '.json')                      { $kind = 'xray'; $dir = "$AWG_DIR/xray-configs"; $remoteExt = '.json' }
+        elseif ($ext -eq '.yaml' -or $ext -eq '.yml')  { $kind = 'hy2';  $dir = "$AWG_DIR/hy2-configs";  $remoteExt = '.yaml' }
+        else { Write-Warn "Пропуск (расширение '$ext' не .conf/.json/.yaml): $leaf"; continue }
+
+        if ($kind -eq 'awg' -and -not ($text -match '\[Interface\]' -and $text -match '\[Peer\]')) {
+            Write-Warn "  $leaf не похож на awg-конфиг ([Interface]/[Peer] нет) — залью как есть."
+        }
+        $items += [pscustomobject]@{ Kind = $kind; Local = $p; Name = $base; Dir = $dir; RemoteExt = $remoteExt; Text = $text }
+    }
+    if ($items.Count -eq 0) { Write-Warn "Нечего заливать — подходящих конфигов не найдено."; return }
+
+    # 2) Сводка + подтверждение (одно на всю пачку).
+    Write-Host "Будет залито:" -ForegroundColor DarkGray
+    foreach ($it in $items) {
+        $lbl = switch ($it.Kind) { 'awg' { 'AmneziaWG' } 'xray' { 'Xray' } 'hy2' { 'Hysteria2' } }
+        Write-Host ("  [{0,-9}] {1}{2}  ->  {3}/" -f $lbl, $it.Name, $it.RemoteExt, $it.Dir) -ForegroundColor DarkGray
+    }
+    if (@($items | Where-Object { $_.Kind -eq 'awg' }).Count -gt 0 -and -not (Test-AwgInstalled)) {
+        Write-Warn "AmneziaWG на роутере не установлен — awg-конфиги лягут про запас (активируются после установки AmneziaWG)."
+    }
+    if (-not (_Confirm "Залить эти $($items.Count) конфиг(ов) на роутер?")) { Write-Warn "Отмена"; return }
+
+    # 3) Заливаем атомарно (Send-RouterFileAtomic нормализует CRLF->LF и chmod 600).
+    $ok = 0; $fail = 0
+    foreach ($it in $items) {
+        $dst = "$($it.Dir)/$($it.Name)$($it.RemoteExt)"
+        Invoke-Router -Command "mkdir -p '$($it.Dir)'" -Silent | Out-Null
+        Write-Info "  -> $dst"
+        if (Send-RouterFileAtomic $dst $it.Text 600) { $ok++ } else { Write-Err "    не залился"; $fail++ }
+    }
+    Write-Host ""
+    if ($fail -eq 0) { Write-Ok "Готово: залито конфигов — $ok." }
+    else { Write-Warn "Залито $ok, не удалось $fail." }
+    Write-Host "Активировать нужный: «Серверы AmneziaWG» -> Сменить страну/конфиг (awg)," -ForegroundColor DarkGray
+    Write-Host "или «Протокол» -> Xray/Hysteria2: выбрать активный конфиг." -ForegroundColor DarkGray
 }
 
 # ============================================================
@@ -1143,24 +1253,48 @@ function Set-ActiveXrayConfig {
 }
 
 function Action-SwitchTransport {
-    Write-Section "Транспорт: AmneziaWG <-> Xray"
+    Write-Section "Переключить транспорт VPN"
+    $lbl = @{ awg = "AmneziaWG"; xray = "Xray"; hy2 = "Hysteria2" }
     $t = Get-Transport
-    Write-Host "Текущий транспорт: $t"
-    if ($t -eq "xray") {
-        if (-not (_Confirm "Вернуться на AmneziaWG?")) { Write-Warn "Отмена"; return }
-        Write-Host ((Invoke-Router -Command "sh $AWG_DIR/xray-transport.sh down") -join "`n")
-        # Ручной выбор = «домашний» транспорт (для авто-возврата в режиме home).
-        # Авто-cross в watchdog .transport-home НЕ трогает — «дом» только ручной.
-        Invoke-Router -Command "echo awg > $AWG_DIR/.transport-home" -Silent | Out-Null
-    } else {
-        if ((Get-XrayConfigNames).Count -eq 0) { Write-Warn "Нет xray-конфигов — добавь сначала (vless:// или JSON)."; return }
-        if (-not (Get-ActiveXrayName)) { Write-Warn "Не выбран активный xray-конфиг (см. «Выбрать активный xray-конфиг»)."; return }
-        Write-Host "Весь дом -> Xray (заблок-трафик пойдёт через xray)." -ForegroundColor Yellow
-        if (-not (_Confirm "Включить Xray-транспорт?")) { Write-Warn "Отмена"; return }
-        Write-Host ((Invoke-Router -Command "sh $AWG_DIR/xray-transport.sh up") -join "`n")
-        Invoke-Router -Command "echo xray > $AWG_DIR/.transport-home" -Silent | Out-Null
-        Show-XrayEgressVerdict (Get-ActiveXrayName)
+    $curLbl = if ($lbl[$t]) { $lbl[$t] } else { $t }
+    Write-Host "Текущий транспорт: $curLbl ($t)"
+    # Готовые транспорты (плагин + секрет-конфиг + бинарь) берём у ОРКЕСТРАТОРА —
+    # он один знает, что реально установлено (на флеше живёт ОДИН альт: xray ЛИБО hy2).
+    $raw = Invoke-Router -Command "sh $AWG_DIR/transport.sh list 2>/dev/null" -Silent
+    $avail = @((("" + ($raw -join "`n")) -split "`r?`n") | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object { $_.Trim() })
+    # Цели переключения = готовые транспорты, КРОМЕ текущего. Раньше тут стоял
+    # `$avail.Count -lt 2`, но он ломал ВОССТАНОВЛЕНИЕ из осиротевшего состояния: если
+    # текущий .transport сам не готов (напр. =awg, а awg-демон не установлен после
+    # hy2-only установки), avail=[hy2] (count 1) и меню отказывало встать на hy2.
+    # Правильно: считать цели без текущего и пускать, если есть хоть одна.
+    $targets = @($avail | Where-Object { $_ -ne $t })
+    if ($targets.Count -lt 1) {
+        if ($avail.Count -le 1) { Write-Warn "Готов только один транспорт ($($avail -join ', ')) — переключать не на что. Добавь конфиг альт-протокола." }
+        else { Write-Warn "Других готовых транспортов нет (готов: $($avail -join ', '))." }
+        return
     }
+    $i = 1; $map = @{}
+    foreach ($n in $avail) {
+        $mk = if ($n -eq $t) { "  <- сейчас" } else { "" }
+        $nm = if ($lbl[$n]) { $lbl[$n] } else { $n }
+        Write-Host "  $i) $nm ($n)$mk"; $map["$i"] = $n; $i++
+    }
+    Write-Host "  0) Отмена"
+    $sel = Read-Host "На какой транспорт переключить"
+    if ($sel -eq "0" -or -not $map.ContainsKey($sel)) { Write-Warn "Отмена"; return }
+    $target = $map[$sel]
+    if ($target -eq $t) { Write-Warn "Уже на $curLbl"; return }
+    if ($target -eq "xray" -and -not (Get-ActiveXrayName)) { Write-Warn "Нет активного xray-конфига."; return }
+    if ($target -eq "hy2"  -and -not (Get-ActiveHy2Name))  { Write-Warn "Нет активного hy2-конфига."; return }
+    $tLbl = if ($lbl[$target]) { $lbl[$target] } else { $target }
+    if ($target -ne "awg") { Write-Host "Весь дом -> $tLbl (заблок-трафик пойдёт через $target)." -ForegroundColor Yellow }
+    if (-not (_Confirm "Переключить транспорт на $tLbl ($target)?")) { Write-Warn "Отмена"; return }
+    Write-Host ((Invoke-Router -Command "sh $AWG_DIR/transport.sh switch $target") -join "`n")
+    # Ручной выбор = «домашний» транспорт (для авто-возврата в режиме home). Авто-cross
+    # в watchdog .transport-home НЕ трогает — «дом» только ручной.
+    Invoke-Router -Command "echo $target > $AWG_DIR/.transport-home" -Silent | Out-Null
+    if ($target -eq "xray") { Show-XrayEgressVerdict (Get-ActiveXrayName) }
+    elseif ($target -eq "hy2") { Show-Hy2EgressVerdict (Get-ActiveHy2Name) }
     $script:RouterSummary = Get-RouterSummary   # обновить «Протокол · Конфиг» в шапке
 }
 
@@ -1254,6 +1388,187 @@ function Action-DeleteXrayConfig {
     if (-not (_Confirm "Удалить xray-конфиг '$name'?")) { Write-Warn "Отмена"; return }
     Invoke-Router -Command "rm -f $AWG_DIR/xray-configs/$name.json" -Silent | Out-Null
     if ($name -eq $active) { Invoke-Router -Command "rm -f $AWG_DIR/.xray-active" -Silent | Out-Null }
+    Write-Ok "Удалён: $name"
+}
+
+# ============================================================
+# Hysteria2-транспорт (альтернатива Xray; на флеше живёт ОДИН альт — xray ЛИБО hy2).
+# Несущая та же (xtun через общий hev + socks 127.0.0.1:10808), меняется лишь локальный
+# socks-сервер. Конфиги — $AWG_DIR/hy2-configs/<name>.yaml (секрет), активный копируется
+# в hysteria.yaml. YAML простой — генерим/правим ЗДЕСЬ (на роутере нет yaml-парсера).
+# ============================================================
+function Get-Hy2ConfigNames {
+    $raw = Invoke-Router -Command "ls -1 $AWG_DIR/hy2-configs/ 2>/dev/null | grep '\.yaml$' | sed 's/\.yaml$//'" -Silent
+    if (-not $raw) { return @() }
+    return @((("" + ($raw -join "`n")) -split "`r?`n") | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object { $_.Trim() })
+}
+function Get-ActiveHy2Name { return ("" + (Invoke-Router -Command "cat $AWG_DIR/.hy2-active 2>/dev/null" -Silent)).Trim() }
+
+# Парсер hy2:// / hysteria2:// : auth@host:port/?sni=&insecure=&obfs=&obfs-password=#remark
+function Parse-Hy2Link {
+    param([string]$link)
+    if ($link -match '^hysteria2://') { $s = $link.Substring(12) }
+    elseif ($link -match '^hy2://')   { $s = $link.Substring(6) }
+    else { return $null }
+    $remark = ""
+    if ($s.Contains('#')) { $k = $s.IndexOf('#'); $remark = [uri]::UnescapeDataString($s.Substring($k + 1)); $s = $s.Substring(0, $k) }
+    $query = ""
+    if ($s.Contains('?')) { $k = $s.IndexOf('?'); $query = $s.Substring($k + 1); $s = $s.Substring(0, $k) }
+    $s = $s.TrimEnd('/')
+    # auth = всё до последнего @ (пароль может содержать что угодно, кроме @); host:port — хвост.
+    if ($s -notmatch '^(.*)@([^@:]+):(\d+)$') { return $null }
+    $p = @{ auth = [uri]::UnescapeDataString($Matches[1]); host = $Matches[2]; port = $Matches[3]; remark = $remark; insecure = $false }
+    foreach ($kv in ($query -split '&')) {
+        if (-not $kv) { continue }
+        $eq = $kv.IndexOf('='); if ($eq -lt 0) { continue }
+        $key = $kv.Substring(0, $eq); $val = [uri]::UnescapeDataString($kv.Substring($eq + 1))
+        switch ($key) {
+            'sni'          { $p.sni = $val }
+            'insecure'     { $p.insecure = ($val -eq '1' -or $val -eq 'true') }
+            'obfs'         { $p.obfs = $val }
+            'obfs-password' { $p.obfsPass = $val }
+            'obfsParam'    { $p.obfsPass = $val }
+        }
+    }
+    if (-not $p.sni) { $p.sni = $p.host }
+    return $p
+}
+
+# YAML-строка значения в двойных кавычках (пароли/obfs могут содержать спецсимволы YAML).
+function _Hy2Quote($v) { return '"' + (($v -replace '\\', '\\') -replace '"', '\"') + '"' }
+
+function New-Hy2ConfigYaml {
+    param([hashtable]$P)
+    $sni = if ($P.sni) { $P.sni } else { $P.host }
+    $ins = if ($P.insecure) { 'true' } else { 'false' }
+    $lines = @()
+    $lines += "server: $($P.host):$($P.port)"
+    $lines += "auth: $(_Hy2Quote $P.auth)"
+    $lines += "tls:"
+    $lines += "  sni: $sni"
+    $lines += "  insecure: $ins"
+    if ($P.obfs -eq 'salamander' -and $P.obfsPass) {
+        $lines += "obfs:"
+        $lines += "  type: salamander"
+        $lines += "  salamander:"
+        $lines += "    password: $(_Hy2Quote $P.obfsPass)"
+    }
+    # socks5.listen ЖЁСТКО 127.0.0.1:10808 — должно совпадать с hev.yaml и health-пробой.
+    $lines += "socks5:"
+    $lines += "  listen: 127.0.0.1:10808"
+    return (($lines -join "`n") + "`n")
+}
+
+# Мгновенная проба egress через socks 10808 (как Show-XrayEgressVerdict — тот же порт).
+function Show-Hy2EgressVerdict {
+    param([string]$name)
+    Write-Host "Проверяю egress через hysteria..." -ForegroundColor DarkGray
+    $ip = ("" + (Invoke-Router -Command "curl -s --max-time 8 --socks5-hostname 127.0.0.1:10808 https://api.ipify.org 2>/dev/null" -Silent)).Trim()
+    if ($ip) {
+        Write-Ok "Hysteria2 '$name' работает — выходной IP: $ip"
+    } else {
+        Write-Warn "Hysteria2 '$name' подключился, но egress ПУСТ — сервер/конфиг не отвечает (порт/sni/insecure/пароль?)."
+        Write-Host "  Авто-failover вернёт рабочий резерв через ~2-4 мин (анти-дребезг)," -ForegroundColor Yellow
+        Write-Host "  либо выбери другой hy2-конфиг сейчас (Протокол -> Выбрать активный hy2-конфиг)." -ForegroundColor Yellow
+    }
+}
+
+function Set-ActiveHy2Config {
+    param([string]$name)
+    $cmd = "cp $AWG_DIR/hy2-configs/$name.yaml $AWG_DIR/hysteria.yaml && chmod 600 $AWG_DIR/hysteria.yaml && echo $name > $AWG_DIR/.hy2-active && echo OK"
+    $out = Invoke-Router -Command $cmd
+    if ("$out" -notmatch "OK") { Write-Err "Не удалось активировать $name"; Write-Host ($out -join "`n"); return }
+    Write-Ok "Активный hy2-конфиг: $name"
+    if ((Get-Transport) -eq "hy2") {
+        Write-Host "Транспорт=hy2 — перезапускаю с новым конфигом..." -ForegroundColor DarkGray
+        Write-Host ((Invoke-Router -Command "sh $AWG_DIR/transport-hy2.sh down; sh $AWG_DIR/transport-hy2.sh up") -join "`n")
+        Show-Hy2EgressVerdict $name
+    }
+    $script:RouterSummary = Get-RouterSummary   # обновить «Протокол · Конфиг» в шапке
+}
+
+function Action-AddHy2Config {
+    Write-Section "Добавить hy2-конфиг (hy2:// или hysteria2://)"
+    Write-Host "Вставь hy2://... одной строкой (от своего Hysteria2-сервера)." -ForegroundColor DarkGray
+    $raw = Read-Host "hy2:// или hysteria2://"
+    if (-not $raw) { Write-Warn "Отмена"; return }
+    $raw = $raw.Trim().Trim('"')
+    $p = Parse-Hy2Link $raw
+    if (-not $p) { Write-Err "Не разобрал hy2://-ссылку"; return }
+    if (-not $p.obfs) { Write-Warn "В ссылке нет obfs (Salamander) — без него hy2 = голый QUIC/TLS, DPI может палить. Для РФ желателен obfs на сервере." }
+    $yaml = New-Hy2ConfigYaml $p
+    $defName = if ($p.remark) { $p.remark } else { "hy2" }
+    $defName = ($defName -replace '[^A-Za-z0-9._-]', '-'); if (-not $defName) { $defName = "hy2" }
+    $inName = Read-Host "Имя конфига (Enter = '$defName')"
+    $name = if ($inName) { $inName.Trim() } else { $defName }
+    if ($name -notmatch '^[A-Za-z0-9._-]+$') { Write-Err "Имя: латиница/цифры/._-"; return }
+    Invoke-Router -Command "mkdir -p $AWG_DIR/hy2-configs" -Silent | Out-Null
+    if (-not (Send-RouterFileAtomic "$AWG_DIR/hy2-configs/$name.yaml" $yaml 600)) { Write-Err "Не залил конфиг"; return }
+    Write-Ok "hy2-конфиг '$name' сохранён"
+    if (_Confirm "Сделать '$name' активным сейчас?") { Set-ActiveHy2Config $name }
+    else { Write-Host "Активировать позже: «Выбрать активный hy2-конфиг»." -ForegroundColor DarkGray }
+}
+
+function Action-SwitchHy2Config {
+    Write-Section "Выбрать активный hy2-конфиг"
+    $names = Get-Hy2ConfigNames
+    if ($names.Count -eq 0) { Write-Warn "Нет hy2-конфигов."; return }
+    $active = Get-ActiveHy2Name
+    $i = 1; $map = @{}
+    foreach ($n in $names) { $mk = if ($n -eq $active) { "  <- активный" } else { "" }; Write-Host "  $i) $n$mk"; $map["$i"] = $n; $i++ }
+    Write-Host "  0) Отмена"
+    $sel = Read-Host "Номер"
+    if ($sel -eq "0" -or -not $map.ContainsKey($sel)) { Write-Warn "Отмена"; return }
+    Set-ActiveHy2Config $map[$sel]
+}
+
+function Action-EditHy2 {
+    Write-Section "Правка SNI / insecure hy2-конфига"
+    $names = Get-Hy2ConfigNames
+    if ($names.Count -eq 0) { Write-Warn "Нет hy2-конфигов."; return }
+    $active = Get-ActiveHy2Name
+    $i = 1; $map = @{}
+    foreach ($n in $names) { $mk = if ($n -eq $active) { "  <- активный" } else { "" }; Write-Host "  $i) $n$mk"; $map["$i"] = $n; $i++ }
+    Write-Host "  0) Отмена"
+    $sel = Read-Host "Какой конфиг править"
+    if ($sel -eq "0" -or -not $map.ContainsKey($sel)) { Write-Warn "Отмена"; return }
+    $name = $map[$sel]
+    # ВАЖНО: Invoke-Router возвращает МАССИВ строк; `"" + массив` склеил бы их через
+    # $OFS = ПРОБЕЛ → все переводы строк YAML стали бы пробелами, файл схлопнулся бы в
+    # ОДНУ строку. YAML чувствителен к переносам (ключи на своих строках), и на роутере
+    # busybox `grep '^server:'` тогда хватает ВЕСЬ файл как значение server → резолв
+    # server-host падает, несущая не встаёт. Поэтому собираем обратно через `n (LF).
+    $txt = ((Invoke-Router -Command "cat $AWG_DIR/hy2-configs/$name.yaml 2>/dev/null" -Silent) -join "`n")
+    if (-not $txt.Trim()) { Write-Err "Не прочитал конфиг"; return }
+    $curSni = if ($txt -match '(?m)^\s*sni:\s*(.+?)\s*$') { $Matches[1] } else { "?" }
+    $curIns = if ($txt -match '(?m)^\s*insecure:\s*(.+?)\s*$') { $Matches[1] } else { "?" }
+    Write-Host ("Сейчас: SNI=$curSni  insecure=$curIns")
+    Write-Warn "SNI помогает ТОЛЬКО если сервер допускает это имя в сертификате — иначе TLS оборвётся."
+    $newSni = Read-Host "Новый SNI (Enter=без изм)"
+    $newIns = Read-Host "insecure true/false (Enter=без изм)"
+    $txt = ($txt -replace "`r", "")
+    if ($newSni) { $txt = $txt -replace '(?m)^(\s*sni:\s*).*$', "`${1}$($newSni.Trim())" }
+    if ($newIns -eq 'true' -or $newIns -eq 'false') { $txt = $txt -replace '(?m)^(\s*insecure:\s*).*$', "`${1}$newIns" }
+    if (-not (Send-RouterFileAtomic "$AWG_DIR/hy2-configs/$name.yaml" $txt 600)) { Write-Err "Не сохранил"; return }
+    Write-Ok "Сохранено"
+    if ($name -eq $active) { Set-ActiveHy2Config $name }
+}
+
+function Action-DeleteHy2Config {
+    Write-Section "Удалить hy2-конфиг"
+    $names = Get-Hy2ConfigNames
+    if ($names.Count -eq 0) { Write-Warn "Нет hy2-конфигов."; return }
+    $active = Get-ActiveHy2Name
+    $i = 1; $map = @{}
+    foreach ($n in $names) { $mk = if ($n -eq $active) { "  <- активный" } else { "" }; Write-Host "  $i) $n$mk"; $map["$i"] = $n; $i++ }
+    Write-Host "  0) Отмена"
+    $sel = Read-Host "Какой удалить"
+    if ($sel -eq "0" -or -not $map.ContainsKey($sel)) { Write-Warn "Отмена"; return }
+    $name = $map[$sel]
+    if ($name -eq $active -and (Get-Transport) -eq "hy2") { Write-Err "Активный конфиг при транспорте hy2 — сначала переключись на другой транспорт."; return }
+    if (-not (_Confirm "Удалить hy2-конфиг '$name'?")) { Write-Warn "Отмена"; return }
+    Invoke-Router -Command "rm -f $AWG_DIR/hy2-configs/$name.yaml" -Silent | Out-Null
+    if ($name -eq $active) { Invoke-Router -Command "rm -f $AWG_DIR/.hy2-active" -Silent | Out-Null }
     Write-Ok "Удалён: $name"
 }
 
@@ -1656,11 +1971,24 @@ function Action-NotifyTest {
     # Тема/текст латиницей: при передаче через plink кириллица в аргументах
     # может побиться. Реальные письма watchdog генерит на роутере (UTF-8) —
     # там кириллица корректна.
-    $cmd = "sh $AWG_DIR/notify.sh 'BE7000 notify test' 'If you got this, email notifications work.'; echo RC=`$?; tail -3 /tmp/notify.log"
+    # ВАЖНО: notify.sh ВЫХОДИТ С КОДОМ 0, даже когда почта НЕ настроена (нет
+    # notify.conf или пустой SMTP_PASS) — это сделано нарочно, чтобы watchdog не
+    # считал ненастроенную почту ошибкой. Значит «RC=0» САМ ПО СЕБЕ не означает,
+    # что письмо ушло (так получался ложный «[OK] отправлено» при пустом конфиге).
+    # Поэтому сперва проверяем конфиг на роутере; только если он есть и заполнен —
+    # реальный RC notify.sh достоверен (0 = сервер принял 235+queued, 1 = отказ SMTP).
+    $cmd = "cd $AWG_DIR || exit 1; " +
+           "if [ ! -s notify.conf ]; then echo RESULT=NOCONF; exit 0; fi; " +
+           "if ! grep -q '^SMTP_PASS=.' notify.conf; then echo RESULT=NOPASS; exit 0; fi; " +
+           "sh notify.sh 'BE7000 notify test' 'If you got this, email notifications work.'; " +
+           "echo RC=`$?; echo '---TAIL---'; tail -4 /tmp/notify.log"
     $out = Invoke-Router -Command $cmd
-    Write-Host ($out -join "`n")
-    if ("$out" -match "RC=0") { Write-Ok "Письмо отправлено — проверь почту (и папку Спам)." }
-    else { Write-Warn "Не отправилось. Проверь логин/пароль приложения: пункт 'Настроить почту'." }
+    $txt = ($out -join "`n")
+    Write-Host $txt
+    if     ($txt -match 'RESULT=NOCONF') { Write-Warn "Почта НЕ настроена: на роутере нет notify.conf (или он пуст). Письмо НЕ отправлено — сначала 'Настроить почту'." }
+    elseif ($txt -match 'RESULT=NOPASS') { Write-Warn "notify.conf есть, но не заполнен пароль приложения (SMTP_PASS). Письмо НЕ отправлено — перезапусти 'Настроить почту'." }
+    elseif ($txt -match 'RC=0')          { Write-Ok "Письмо отправлено и принято сервером Яндекса (250 queued) — проверь почту (и папку Спам)." }
+    else                                 { Write-Warn "Сервер не принял письмо. Проверь логин и ПАРОЛЬ ПРИЛОЖЕНИЯ Яндекса (не основной пароль): 'Настроить почту'." }
 }
 
 function Action-NotifyToggle {
@@ -1945,6 +2273,7 @@ ls -l /tmp/*.log 2>/dev/null | awk '{s+=$5}END{printf "LOGS %d %d\n",(s+1023)/10
 }
 
 function PreFlight {
+    param([string]$Proto = "awg")   # awg | xray | both — awg.conf нужен только при awg/both
     Write-Section "Pre-flight проверки"
     $problems = @()
 
@@ -1961,7 +2290,9 @@ function PreFlight {
     # 2. Локальные файлы
     Write-Info "Папка скрипта: $SCRIPT_DIR"
     $missing = @()
-    foreach ($f in $REQUIRED_FILES) {
+    # При xray-only awg.conf не нужен — исключаем его из обязательных.
+    $reqFiles = if ($Proto -eq 'xray' -or $Proto -eq 'hy2') { $REQUIRED_FILES | Where-Object { $_ -ne 'awg.conf' } } else { $REQUIRED_FILES }
+    foreach ($f in $reqFiles) {
         $p = Join-Path $SCRIPT_DIR $f
         if (Test-Path $p) {
             $size = (Get-Item $p).Length
@@ -2011,27 +2342,41 @@ function PreFlight {
         return $false
     }
 
-    # 3. Валидация awg.conf
-    $confPath = Join-Path $SCRIPT_DIR "awg.conf"
-    $conf = Get-Content $confPath -Raw
-    if ($conf -notmatch '\[Interface\]') { Write-Err "В awg.conf нет [Interface]"; return $false }
-    if ($conf -notmatch '\[Peer\]')      { Write-Err "В awg.conf нет [Peer]";      return $false }
-    if ($conf -notmatch 'PrivateKey\s*=') { Write-Err "В awg.conf нет PrivateKey"; return $false }
-    if ($conf -notmatch 'PublicKey\s*=')  { Write-Err "В awg.conf нет PublicKey";  return $false }
-    if ($conf -notmatch 'Endpoint\s*=')   { Write-Err "В awg.conf нет Endpoint";   return $false }
-    Write-Ok "awg.conf валиден (есть [Interface], [Peer], PrivateKey, PublicKey, Endpoint)"
+    # 3. Валидация конфига транспорта.
+    if ($Proto -eq 'xray') {
+        # xray-only: awg.conf не нужен. Нужны бинарники xray + hev (tun2socks).
+        if ($binFound -notcontains 'xray.user') { Write-Err "Для Xray нужен bin/xray.user (ARM64 ELF) -- не найден или битый"; return $false }
+        if ($binFound -notcontains 'hev.user')  { Write-Err "Для Xray нужен bin/hev.user (tun2socks, ARM64 ELF) -- не найден или битый"; return $false }
+        Write-Ok "Xray-бинарники на месте (xray.user + hev.user). awg.conf для xray-only не требуется."
+        Write-Info "xray-конфиг (vless://) спросим в процессе установки."
+    } elseif ($Proto -eq 'hy2') {
+        # hy2-only: awg.conf не нужен. Нужны бинарники hysteria + hev (tun2socks).
+        if ($binFound -notcontains 'hysteria.user') { Write-Err "Для Hysteria2 нужен bin/hysteria.user (ARM64 ELF) -- не найден или битый"; return $false }
+        if ($binFound -notcontains 'hev.user')      { Write-Err "Для Hysteria2 нужен bin/hev.user (tun2socks, ARM64 ELF) -- не найден или битый"; return $false }
+        Write-Ok "Hysteria2-бинарники на месте (hysteria.user + hev.user). awg.conf для hy2-only не требуется."
+        Write-Info "hy2-конфиг (hy2://) спросим в процессе установки."
+    } else {
+        $confPath = Join-Path $SCRIPT_DIR "awg.conf"
+        $conf = Get-Content $confPath -Raw
+        if ($conf -notmatch '\[Interface\]') { Write-Err "В awg.conf нет [Interface]"; return $false }
+        if ($conf -notmatch '\[Peer\]')      { Write-Err "В awg.conf нет [Peer]";      return $false }
+        if ($conf -notmatch 'PrivateKey\s*=') { Write-Err "В awg.conf нет PrivateKey"; return $false }
+        if ($conf -notmatch 'PublicKey\s*=')  { Write-Err "В awg.conf нет PublicKey";  return $false }
+        if ($conf -notmatch 'Endpoint\s*=')   { Write-Err "В awg.conf нет Endpoint";   return $false }
+        Write-Ok "awg.conf валиден (есть [Interface], [Peer], PrivateKey, PublicKey, Endpoint)"
 
-    # Определим версию AWG
-    $awgVer = "1.0 (Legacy)"
-    if ($conf -match '(?m)^\s*S3\s*=' -or $conf -match '(?m)^\s*S4\s*=' -or $conf -match '(?m)^\s*H[1-4]\s*=\s*\d+-\d+') {
-        $awgVer = "2.0"
-    } elseif ($conf -match '(?m)^\s*I1\s*=\s*\S+') {
-        $awgVer = "1.5"
-    }
-    Write-Info "Версия AWG в конфиге: $awgVer"
-    if ($awgVer -eq "2.0" -and $binFound.Count -eq 0) {
-        Write-Warn "У тебя AWG 2.0, но нет своих бинарников. awg_setup.sh ставит старые сборки -- они могут упасть с 'Line unrecognized: S3=...'"
-        Write-Warn "Либо используй готовые бинарники из репозитория (awg.user/amneziawg-go.user), либо Legacy-конфиг на VPS."
+        # Определим версию AWG
+        $awgVer = "1.0 (Legacy)"
+        if ($conf -match '(?m)^\s*S3\s*=' -or $conf -match '(?m)^\s*S4\s*=' -or $conf -match '(?m)^\s*H[1-4]\s*=\s*\d+-\d+') {
+            $awgVer = "2.0"
+        } elseif ($conf -match '(?m)^\s*I1\s*=\s*\S+') {
+            $awgVer = "1.5"
+        }
+        Write-Info "Версия AWG в конфиге: $awgVer"
+        if ($awgVer -eq "2.0" -and $binFound.Count -eq 0) {
+            Write-Warn "У тебя AWG 2.0, но нет своих бинарников. awg_setup.sh ставит старые сборки -- они могут упасть с 'Line unrecognized: S3=...'"
+            Write-Warn "Либо используй готовые бинарники из репозитория (awg.user/amneziawg-go.user), либо Legacy-конфиг на VPS."
+        }
     }
 
     # 4. Доступность роутера
@@ -2132,7 +2477,38 @@ function Action-Backup {
     if ($b) { Write-Ok "Готово: $b" }
 }
 
+# Какой АЛЬТ (xray|hy2|none) оставляем для выбранного протокола установки. Альты
+# xray/hy2 взаимоисключающи на флеше; awg — база (в выбор альта не входит, авто-очисткой
+# не удаляется). awg-only / неизвестно → 'none' (альта нет, оба alt-бинаря + hev снимаются).
+function Get-SelectedAlt([string]$Proto) {
+    switch ($Proto) {
+        'xray'    { 'xray' }
+        'both'    { 'xray' }
+        'hy2'     { 'hy2' }
+        'bothhy2' { 'hy2' }
+        default   { 'none' }
+    }
+}
+
+# Что РЕАЛЬНО установлено на роутере — по наличию рабочих бинарей в корне $AWG_DIR (а НЕ
+# по конфигам/.transport: версие-независимо, не зависит от transport.sh). Возвращает proto-
+# строку для Upload-AllFiles (awg/xray/hy2/both/bothhy2) или $null, если не определилось.
+# Нужно «Обновить скрипты», чтобы заливать awg.conf лишь когда awg реально стоит (а не
+# плодить осиротевший awg.conf на alt-only роутере). $A/$X/$H — переменные РОУТЕРА (backtick).
+function Get-InstalledProto {
+    $r = "" + (Invoke-Router -Command "A=0; X=0; H=0; [ -x $AWG_DIR/amneziawg-go ] && A=1; [ -x $AWG_DIR/xray ] && X=1; [ -x $AWG_DIR/hysteria ] && H=1; echo INSTPROTO:`$A`$X`$H" -Silent)
+    if ($r -notmatch 'INSTPROTO:(\d)(\d)(\d)') { return $null }
+    $a = $Matches[1] -eq '1'; $x = $Matches[2] -eq '1'; $h = $Matches[3] -eq '1'
+    if ($a -and $x) { return 'both' }
+    if ($a -and $h) { return 'bothhy2' }
+    if ($a) { return 'awg' }
+    if ($x) { return 'xray' }
+    if ($h) { return 'hy2' }
+    return $null
+}
+
 function Upload-AllFiles {
+    param([string]$Proto = "awg", [bool]$PurgeOtherAlt = $false, [bool]$SkipBins = $false)
     Write-Section "Заливаю файлы на роутер ($AWG_DIR)"
 
     # Подготовим директории
@@ -2142,8 +2518,10 @@ function Upload-AllFiles {
         return $false
     }
 
-    # Главные файлы
+    # Главные файлы. При xray-only НЕ заливаем awg.conf — иначе установщик увидит
+    # HAVE_AWG=1 и поднимет ещё и AmneziaWG (получился бы «оба», а не чистый Xray).
     $allFiles = @($REQUIRED_FILES) + @($OPTIONAL_FILES | Where-Object { Test-Path (Join-Path $SCRIPT_DIR $_) })
+    if ($Proto -eq 'xray' -or $Proto -eq 'hy2') { $allFiles = $allFiles | Where-Object { $_ -ne 'awg.conf' } }
     foreach ($f in $allFiles) {
         $local = Join-Path $SCRIPT_DIR $f
         if (-not (Test-Path $local)) { continue }
@@ -2154,14 +2532,49 @@ function Upload-AllFiles {
         }
     }
 
-    # Бинарники в bin/
-    foreach ($k in $BIN_FILES.Keys) {
-        $local = Join-Path $SCRIPT_DIR $BIN_FILES[$k]
-        if (-not (Test-Path $local)) { continue }
-        Write-Info "  -> bin/$k"
-        if (-not (Upload-File -LocalPath $local -RemotePath "$AWG_DIR/bin/$k")) {
-            Write-Err "Загрузка bin/$k сорвалась"
-            return $false
+    # СВОП АЛЬТА: перед заливкой тяжёлых alt-бинарей снимаем бинарь СТАРОГО (невыбранного)
+    # альта на роутере — иначе на awg+xray -> awg+hy2 пик (старый+новый альт) переполнит
+    # /data ~20 МБ. Делает router-side awg-setup (он залит ВЫШЕ в этом же вызове = новая
+    # версия с субкомандой purge-alt) → PS-guard на литерал rm не мешает (rm живёт в .sh на
+    # роутере). Гейт $PurgeOtherAlt: ТОЛЬКО при реальной установке (Action-Install); «Обновить
+    # скрипты» (Action-UpdateScripts) зовёт Upload-AllFiles без флага → альты не трогаются.
+    if ($PurgeOtherAlt) {
+        $selAlt = Get-SelectedAlt $Proto
+        Write-Info "  очистка невыбранного альта (оставляем: $selAlt)"
+        Invoke-Router -Command "INSTALL_ALT=$selAlt sh $AWG_DIR/awg-setup-be7000.sh purge-alt 2>&1" -Silent | Out-Null
+    }
+
+    # Бинарники в bin/ — ТОЛЬКО нужные выбранному протоколу. Флеш /data тесный (~20 МБ):
+    # держать на нём ОБА альта (xray 7.6 + hy2 4.6) нельзя, а awg-база (5 МБ) при alt-only
+    # бесполезна. awg/both/bothhy2 → awg-база; xray/both → +xray+hev; hy2/bothhy2 → +hysteria+hev.
+    # $SkipBins: «Обновить скрипты» (Action-UpdateScripts) контрактно шлёт только .sh+awg.conf —
+    # бинари НЕ трогаем, иначе alt-only юзеру лились бы лишние awg-бинари (~5 МБ) в bin/.
+    if (-not $SkipBins) {
+        $needBins = @()
+        if ($Proto -eq 'awg' -or $Proto -eq 'both' -or $Proto -eq 'bothhy2') { $needBins += @('amneziawg-go.user', 'awg.user') }
+        if ($Proto -eq 'xray' -or $Proto -eq 'both')    { $needBins += @('xray.user', 'hev.user') }
+        if ($Proto -eq 'hy2'  -or $Proto -eq 'bothhy2') { $needBins += @('hysteria.user', 'hev.user') }
+        # Перед заливкой ТЯЖЁЛОГО bin/-стейджинга снимаем СТАРЫЕ рабочие копии тех же бинарей
+        # в корне $AWG_DIR. ЗАЧЕМ: на реинсталле поверх установленного (напр. awg -> awg+xray)
+        # старый рутовый amneziawg-go (4.85) + новый bin/-стейджинг (amneziawg-go.user 4.85 +
+        # xray.user 7.75 = 13.25) не влезают в пик на 20-МБ /data ещё ДО запуска установщика →
+        # заливка/cp падали «No space». Демоны живут в ПАМЯТИ — снос файла-бинаря их НЕ роняет
+        # (awg0/несущая работают), а установщик переставит бинарь из bin/ (mv). Снимаем только
+        # то, что СЕЙЧАС переустанавливаем (по needBins).
+        $rmRoot = @($needBins | ForEach-Object { $_ -replace '\.user$', '' })
+        if ($rmRoot.Count) {
+            Write-Info "  освобождаю место: снимаю старые рутовые бинари ($($rmRoot -join ', '))"
+            Invoke-Router -Command "cd $AWG_DIR && rm -f $($rmRoot -join ' ')" -Silent | Out-Null
+        }
+        foreach ($k in $needBins) {
+            if (-not $BIN_FILES.ContainsKey($k)) { continue }
+            $local = Join-Path $SCRIPT_DIR $BIN_FILES[$k]
+            if (-not (Test-Path $local)) { continue }
+            Write-Info "  -> bin/$k"
+            if (-not (Upload-File -LocalPath $local -RemotePath "$AWG_DIR/bin/$k")) {
+                Write-Err "Загрузка bin/$k сорвалась"
+                return $false
+            }
         }
     }
 
@@ -2188,9 +2601,14 @@ function Upload-AllFiles {
 }
 
 function Run-Installer {
-    param([bool]$EnableRefilter = $false)
+    param([bool]$EnableRefilter = $false, [string]$Proto = "")
     Write-Section "Запускаю awg-setup-be7000.sh на роутере"
-    $envPrefix = if ($EnableRefilter) { "ENABLE_REFILTER=1 " } else { "" }
+    $envPrefix = ""
+    if ($EnableRefilter) { $envPrefix += "ENABLE_REFILTER=1 " }
+    # INSTALL_PROTO задаёт АКТИВНЫЙ транспорт. Для xray-only -- xray; для awg/both
+    # установщик определит сам (есть awg.conf => awg по умолчанию).
+    if ($Proto -eq 'xray') { $envPrefix += "INSTALL_PROTO=xray " }
+    elseif ($Proto -eq 'hy2') { $envPrefix += "INSTALL_PROTO=hy2 " }
     # Без -Silent -- пользователь должен видеть прогресс
     $r = Invoke-Router -Command "cd $AWG_DIR && ${envPrefix}sh ./awg-setup-be7000.sh 2>&1"
     if ($r) {
@@ -2210,7 +2628,52 @@ function Run-Installer {
 }
 
 function Verify-Install {
+    param([string]$Proto = "awg")
+    # Итог «несущая поднялась?» отдаём через script-scoped переменную (а не return —
+    # функция много пишет в host, а Show-RouterResources мог бы подмешать объект в
+    # пайплайн и испортить булев return). Action-Install читает $script:LastVerifyCarrierUp.
+    $script:LastVerifyCarrierUp = $false
     Write-Section "Проверка после установки"
+    if ($Proto -eq 'xray' -or $Proto -eq 'hy2') {
+        # alt-only: awg0 нет — проверяем egress через socks альт-транспорта (тот же порт 10808).
+        $altLbl = if ($Proto -eq 'hy2') { 'Hysteria2' } else { 'Xray' }
+        $tp = ("" + (Invoke-Router -Command "cat $AWG_DIR/.transport 2>/dev/null" -Silent)).Trim()
+        Write-Info "Активный транспорт: $tp"
+        # Несущая альта поднимается не мгновенно: socks открывается ТОЛЬКО после QUIC/Reality-
+        # хендшейка (для hy2 на DPI-сети ~15-17с). Пробуем egress с ретраями (~30с), чтобы не
+        # объявить провал раньше времени.
+        Write-Info "Проверяю egress через VPN (до ~30 сек)..."
+        $ip = ""
+        for ($i = 0; $i -lt 6; $i++) {
+            $ip = ("" + (Invoke-Router -Command "curl -s --max-time 8 --socks5-hostname 127.0.0.1:10808 https://api.ipify.org 2>/dev/null" -Silent)).Trim()
+            if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
+            Start-Sleep -Seconds 5
+        }
+        if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
+            $script:LastVerifyCarrierUp = $true
+            Write-Ok "$altLbl поднят -- выходной IP через VPN: $ip"
+        } else {
+            # Громко: несущая НЕ встала. Это fail-open (интернет работает напрямую), но VPN
+            # сейчас НЕ несёт трафик. Самая частая причина для конфига «по имени сервера» —
+            # временная DNS-осечка резолва адреса VPS на старте; помогает повтор.
+            Write-Host ""
+            Write-Host "  ------------------------------------------------------------" -ForegroundColor Yellow
+            Write-Warn  "$altLbl НЕСУЩАЯ НЕ ПОДНЯЛАСЬ -- VPN сейчас НЕ работает."
+            Write-Host  "  Интернет идёт НАПРЯМУЮ (fail-open): роутер не завис, но трафик мимо VPN." -ForegroundColor Yellow
+            Write-Host  "  Причины: VPS/конфиг (сервер/порт/sni/пароль/ключи) ЛИБО временный сбой DNS-" -ForegroundColor Yellow
+            Write-Host  "  резолва адреса сервера (если конфиг по ИМЕНИ хоста, а не по IP)." -ForegroundColor Yellow
+            Write-Host  "  Что сделать: меню -> Протокол -> выбрать этот конфиг ещё раз (нередко встаёт со 2-го раза)." -ForegroundColor Yellow
+            Write-Host  "  Не помогло -> Установка и обслуживание -> Диагностика (или Выгрузка дампа)." -ForegroundColor Yellow
+            Write-Host "  ------------------------------------------------------------" -ForegroundColor Yellow
+        }
+        $ipl = ("" + (Invoke-Router -Command "ipset list iplist_set 2>/dev/null | awk '/Number of entries/{print `$NF}'" -Silent)).Trim()
+        if ($ipl -match '^[0-9]+$' -and [int]$ipl -gt 0) { Write-Ok "iplist_set: $ipl подсетей" }
+        else { Write-Warn "iplist пока пуст -- обновится по cron 5:00 или вручную (Источник списка IP -> Обновить)" }
+        $cr = Invoke-Router -Command "grep -qF awg-heal.sh /etc/crontabs/root && echo OK || echo NONE" -Silent
+        if ("$cr" -match "OK") { Write-Ok "awg-heal.sh в cron (boot-восстановление)" } else { Write-Warn "awg-heal.sh не в cron" }
+        Show-RouterResources "Ресурсы роутера (после установки)"
+        return
+    }
     $r = Invoke-Router -Command "$AWG_DIR/awg show awg0 2>/dev/null | head -20"
     if ($r) { Write-Host ($r -join "`n") }
     # Активная проверка handshake с ретраем (возраст последнего HS, как у watchdog:
@@ -2223,6 +2686,7 @@ function Verify-Install {
              "i=`$((i+1)); sleep 5; done; echo HSPROBE=`$ok"
     $pr = Invoke-Router -Command $probe -Silent
     if ("$pr" -match "HSPROBE=1") {
+        $script:LastVerifyCarrierUp = $true
         Write-Ok "Handshake живой -- туннель работает"
     } else {
         # Мёртвый конфиг = DNS-SPOF: dnsmasq форвардит в дохлый awg0, не резолвится
@@ -2238,6 +2702,7 @@ function Verify-Install {
         $hs2 = ("" + (Invoke-Router -Command "$AWG_DIR/awg show awg0 latest-handshakes 2>/dev/null | awk 'NR==1{print `$2}'" -Silent)).Trim()
         $act = ("" + (Invoke-Router -Command "cat $AWG_DIR/.active 2>/dev/null" -Silent)).Trim()
         if ($hs2 -match '^[1-9][0-9]*$') {
+            $script:LastVerifyCarrierUp = $true
             Write-Ok "Переключился на рабочий резерв: $act -- VPN работает."
         } else {
             Write-Warn "Ни один конфиг не поднялся -> ПРЯМОЙ режим (safety_off): интернет и DNS идут мимо VPN, сайты из списка пока недоступны через VPN."
@@ -2275,14 +2740,129 @@ function Verify-Install {
     Show-RouterResources "Ресурсы роутера (после установки)"
 }
 
+# Выбор протокола на первой установке. Возвращает awg | xray | both | $null (отмена).
+# Гарантирует awg.conf в папке скрипта (его читают PreFlight и Upload-AllFiles). Если файла
+# нет — предлагает указать путь к awg.conf от VPS и КОПИРУЕТ его в $SCRIPT_DIR\awg.conf
+# (нормализуя CRLF->LF, секрет-конфиг пишем без BOM). Так юзеру НЕ надо вручную «кидать файл
+# в корень» — достаточно перетащить его в окно при выборе варианта с AmneziaWG. Возвращает
+# $true, если awg.conf на месте (был или только что скопирован).
+function Ensure-AwgConfLocal {
+    $dst = Join-Path $SCRIPT_DIR "awg.conf"
+    if (Test-Path $dst) { return $true }
+    Write-Warn "awg.conf в папке скрипта ($SCRIPT_DIR) не найден."
+    Write-Host "Укажи путь к awg.conf от твоего VPS — скопирую его сюда (можно перетащить файл в окно)." -ForegroundColor DarkGray
+    $raw = Read-Host "Путь к awg.conf (Enter = отмена)"
+    if (-not $raw) { return $false }
+    $src = $raw.Trim().Trim('"')
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { Write-Err "Файл не найден: $src"; return $false }
+    $src = (Resolve-Path -LiteralPath $src).Path
+    try   { $text = [System.IO.File]::ReadAllText($src) }
+    catch { Write-Err "Не смог прочитать файл: $($_.Exception.Message)"; return $false }
+    if ($text -notmatch '\[Interface\]' -or $text -notmatch '\[Peer\]') {
+        if (-not (_Confirm "Файл не похож на awg-конфиг ([Interface]/[Peer] не найдены). Всё равно использовать?")) { return $false }
+    }
+    $text = $text -replace "`r`n", "`n" -replace "`r", "`n"
+    try   { [System.IO.File]::WriteAllText($dst, $text, (New-Object System.Text.UTF8Encoding($false))) }
+    catch { Write-Err "Не смог записать $dst : $($_.Exception.Message)"; return $false }
+    Write-Ok "awg.conf скопирован в папку скрипта: $dst"
+    return $true
+}
+
+function Choose-InstallProtocol {
+    $haveAwgConf = Test-Path (Join-Path $SCRIPT_DIR "awg.conf")
+    $haveXrayBin = Test-Path (Join-Path $SCRIPT_DIR $BIN_FILES['xray.user'])
+    $haveHy2Bin  = Test-Path (Join-Path $SCRIPT_DIR $BIN_FILES['hysteria.user'])
+    Write-Section "Какой VPN-протокол ставим?"
+    if (-not $haveAwgConf) { Write-Info "awg.conf в папке скрипта НЕ найден -- при выборе AmneziaWG спрошу путь к нему (или заранее положи awg.conf от VPS рядом со скриптом)." }
+    if (-not $haveXrayBin) { Write-Info "bin/xray.user не найден -- вариант Xray недоступен." }
+    if (-not $haveHy2Bin)  { Write-Info "bin/hysteria.user не найден -- вариант Hysteria2 недоступен." }
+    Write-Host ""
+    Write-Host "  На флеше /data (~20 МБ) живёт ОДИН альт: Xray ЛИБО Hysteria2 (не оба)." -ForegroundColor DarkGray
+    Write-Host "  1) AmneziaWG (нужен awg.conf)"
+    Write-Host "  2) Xray -- VLESS/Reality (vless:// спрошу дальше)"
+    Write-Host "  3) Hysteria2 -- QUIC (hy2:// спрошу дальше)"
+    Write-Host "  4) AmneziaWG + Xray (awg активный, xray переключателем/резервом)"
+    Write-Host "  5) AmneziaWG + Hysteria2 (awg активный, hy2 переключателем/резервом)"
+    Write-Host "  0) Отмена"
+    $sel = Read-Host "Выбор"
+    switch ($sel) {
+        "1" { if (-not $haveAwgConf -and -not (Ensure-AwgConfLocal)) { Write-Err "Без awg.conf вариант AmneziaWG недоступен"; return $null }; return "awg" }
+        "2" { if (-not $haveXrayBin) { Write-Err "Нет bin/xray.user в папке скрипта"; return $null }; return "xray" }
+        "3" { if (-not $haveHy2Bin)  { Write-Err "Нет bin/hysteria.user в папке скрипта"; return $null }; return "hy2" }
+        "4" { if (-not $haveXrayBin) { Write-Err "Нет bin/xray.user в папке скрипта"; return $null }; if (-not $haveAwgConf -and -not (Ensure-AwgConfLocal)) { Write-Err "Без awg.conf вариант 'awg+xray' недоступен"; return $null }; return "both" }
+        "5" { if (-not $haveHy2Bin)  { Write-Err "Нет bin/hysteria.user в папке скрипта"; return $null }; if (-not $haveAwgConf -and -not (Ensure-AwgConfLocal)) { Write-Err "Без awg.conf вариант 'awg+hy2' недоступен"; return $null }; return "bothhy2" }
+        default { return $null }
+    }
+}
+
+# Гарантирует наличие активного xray-конфига на роутере ДО запуска установщика
+# (тот поднимет xray в конце). Если конфига нет — спрашивает vless:// и провижнит.
+function Ensure-XrayConfigForInstall {
+    if ((Get-XrayConfigNames).Count -gt 0 -and (Get-ActiveXrayName)) {
+        Write-Ok "xray-конфиг уже на роутере: $(Get-ActiveXrayName)"
+        return $true
+    }
+    Write-Section "xray-конфиг (vless://) для установки"
+    Write-Host "Вставь ссылку vless://... от своего VPS (VLESS/Reality)." -ForegroundColor DarkGray
+    $raw = Read-Host "vless://"
+    if (-not $raw) { Write-Warn "Пусто"; return $false }
+    $raw = $raw.Trim().Trim('"')
+    $p = Parse-VlessLink $raw
+    if (-not $p) { Write-Err "Не разобрал vless://"; return $false }
+    if ($p.security -eq 'reality' -and -not $p.pbk) { Write-Warn "В ссылке нет pbk (Reality publicKey) -- проверь" }
+    $json = New-XrayConfigJson $p
+    $name = if ($p.remark) { ($p.remark -replace '[^A-Za-z0-9._-]', '-') } else { "xray" }
+    if (-not $name) { $name = "xray" }
+    Invoke-Router -Command "mkdir -p $AWG_DIR/xray-configs" -Silent | Out-Null
+    if (-not (Send-RouterFileAtomic "$AWG_DIR/xray-configs/$name.json" $json 600)) { Write-Err "Не залил xray-конфиг"; return $false }
+    # Кладём активный конфиг + .transport=xray. БЕЗ перезапуска демонов — установщик
+    # сам поднимет xray в конце (xray-transport.sh up).
+    $r = Invoke-Router -Command "cp $AWG_DIR/xray-configs/$name.json $AWG_DIR/xray.json && chmod 600 $AWG_DIR/xray.json && echo $name > $AWG_DIR/.xray-active && echo xray > $AWG_DIR/.transport && echo OK" -Silent
+    if ("$r" -notmatch "OK") { Write-Err "Не активировал xray-конфиг"; return $false }
+    Write-Ok "xray-конфиг '$name' залит и выбран активным"
+    return $true
+}
+
+# Аналог Ensure-XrayConfigForInstall для Hysteria2: гарантирует активный hy2-конфиг на
+# роутере ДО установщика (тот поднимет hy2 в конце через transport.sh up hy2).
+function Ensure-Hy2ConfigForInstall {
+    if ((Get-Hy2ConfigNames).Count -gt 0 -and (Get-ActiveHy2Name)) {
+        Write-Ok "hy2-конфиг уже на роутере: $(Get-ActiveHy2Name)"
+        return $true
+    }
+    Write-Section "hy2-конфиг (hy2://) для установки"
+    Write-Host "Вставь ссылку hy2://... (или hysteria2://) от своего Hysteria2-сервера." -ForegroundColor DarkGray
+    $raw = Read-Host "hy2://"
+    if (-not $raw) { Write-Warn "Пусто"; return $false }
+    $raw = $raw.Trim().Trim('"')
+    $p = Parse-Hy2Link $raw
+    if (-not $p) { Write-Err "Не разобрал hy2://"; return $false }
+    if (-not $p.obfs) { Write-Warn "В ссылке нет obfs (Salamander) -- без него hy2 уязвим к DPI по QUIC. Для РФ желателен obfs на сервере." }
+    $yaml = New-Hy2ConfigYaml $p
+    $name = if ($p.remark) { ($p.remark -replace '[^A-Za-z0-9._-]', '-') } else { "hy2" }
+    if (-not $name) { $name = "hy2" }
+    Invoke-Router -Command "mkdir -p $AWG_DIR/hy2-configs" -Silent | Out-Null
+    if (-not (Send-RouterFileAtomic "$AWG_DIR/hy2-configs/$name.yaml" $yaml 600)) { Write-Err "Не залил hy2-конфиг"; return $false }
+    # Активный конфиг + .transport=hy2. БЕЗ перезапуска демонов — установщик сам поднимет
+    # hy2 в конце (transport.sh up hy2).
+    $r = Invoke-Router -Command "cp $AWG_DIR/hy2-configs/$name.yaml $AWG_DIR/hysteria.yaml && chmod 600 $AWG_DIR/hysteria.yaml && echo $name > $AWG_DIR/.hy2-active && echo hy2 > $AWG_DIR/.transport && echo OK" -Silent
+    if ("$r" -notmatch "OK") { Write-Err "Не активировал hy2-конфиг"; return $false }
+    Write-Ok "hy2-конфиг '$name' залит и выбран активным"
+    return $true
+}
+
 function Action-Install {
-    if (-not (PreFlight)) {
+    # Выбор протокола: awg / xray / both. От него зависит, нужен ли awg.conf и xray-конфиг.
+    $proto = Choose-InstallProtocol
+    if (-not $proto) { Write-Warn "Отмена"; return }
+
+    if (-not (PreFlight -Proto $proto)) {
         Write-Err "Pre-flight не прошёл -- установка отменена"
         return
     }
 
     Write-Host ""
-    Write-Warn "Сейчас будет: backup -> загрузка файлов -> запуск инсталлера"
+    Write-Warn "Сейчас будет: backup -> загрузка файлов -> запуск инсталлера (протокол: $proto)"
     $ans = Read-Host "Продолжить? (y/N)"
     if ($ans -ne "y" -and $ans -ne "Y") { Write-Warn "Отмена"; return }
 
@@ -2298,10 +2878,35 @@ function Action-Install {
     # желании можно вручную на роутере: ENABLE_REFILTER=1 ./awg-setup-be7000.sh
     $refilter = $false
 
-    # Upload
-    if (-not (Upload-AllFiles)) {
+    # Upload (при xray Upload-AllFiles не зальёт awg.conf; если его и так нет — пропустит)
+    if (-not (Upload-AllFiles -Proto $proto -PurgeOtherAlt $true)) {
         Write-Err "Загрузка файлов сорвалась. Можно откатиться: меню -> Откатить из backup -> $backup"
         return
+    }
+
+    # xray-конфиг (для xray/both): нужен на роутере ДО установщика — он поднимет xray
+    # в конце. Для xray-only обязателен; для both желателен (иначе xray-резерв пустой,
+    # добавишь позже через меню).
+    if ($proto -eq 'xray' -or $proto -eq 'both') {
+        if (-not (Ensure-XrayConfigForInstall)) {
+            if ($proto -eq 'xray') {
+                Write-Err "Без xray-конфига xray-only не поднять. Установка отменена."
+                Write-Info "Откат при необходимости: меню -> Откатить из backup -> $backup"
+                return
+            } else {
+                Write-Warn "xray-конфиг не задан -- ставлю AmneziaWG активным, Xray добавишь позже через меню."
+            }
+        }
+    } elseif ($proto -eq 'hy2' -or $proto -eq 'bothhy2') {
+        if (-not (Ensure-Hy2ConfigForInstall)) {
+            if ($proto -eq 'hy2') {
+                Write-Err "Без hy2-конфига hy2-only не поднять. Установка отменена."
+                Write-Info "Откат при необходимости: меню -> Откатить из backup -> $backup"
+                return
+            } else {
+                Write-Warn "hy2-конфиг не задан -- ставлю AmneziaWG активным, Hysteria2 добавишь позже через меню."
+            }
+        }
     }
 
     # Источник iplist (можно сузить сразу; по умолчанию весь cidr4 с opencck).
@@ -2310,17 +2915,30 @@ function Action-Install {
     Prompt-IplistSourceAtInstall
 
     # Install
-    if (-not (Run-Installer -EnableRefilter $refilter)) {
+    if (-not (Run-Installer -EnableRefilter $refilter -Proto $proto)) {
         Write-Err "Инсталлер упал. Можно откатиться: меню -> Откатить из backup -> $backup"
         return
     }
 
-    # Verify
-    Verify-Install
+    # Verify (результат «несущая поднялась?» кладёт в $script:LastVerifyCarrierUp)
+    Verify-Install -Proto $proto
+    $carrierUp = $script:LastVerifyCarrierUp
     $script:AwgState = "INSTALLED"   # меню теперь покажет блок управления
+    # Установка сменила несущий транспорт/активный конфиг (.transport/.active и т.п.) —
+    # обновляем кэш шапки, иначе «Протокол · Конфиг» висит со старым значением (напр.
+    # ставил awg поверх hy2: транспорт стал awg, а шапка ещё показывала Hysteria2).
+    $script:RouterSummary = Get-RouterSummary
     Write-Host ""
-    Write-Ok "Установка завершена. Если что-то пошло не так -- есть backup: $backup"
-    Write-Info "Дальнейшее управление -- через be7000.bat"
+    # Итог установки ЯВНЫЙ: встала несущая или нет (а не всегда бодрое «завершена»).
+    # Провал подъёма у нас не фатален (fail-open) -> установщик доходит сюда и при мёртвой
+    # несущей; раньше итог это глотал, и было неясно, работает VPN или нет.
+    if ($carrierUp) {
+        Write-Ok "Установка завершена -- VPN поднят и работает."
+    } else {
+        Write-Warn "Установка ЗАВЕРШЕНА, но VPN сейчас НЕ поднят (трафик идёт напрямую) -- см. предупреждение выше."
+        Write-Info "Подними позже: меню -> Протокол -> выбрать конфиг ещё раз; не помогло -> Установка и обслуживание -> Диагностика."
+    }
+    Write-Info "Бэкап на случай отката: $backup. Дальнейшее управление -- через be7000.bat"
 }
 
 function Action-UpdateScripts {
@@ -2333,7 +2951,12 @@ function Action-UpdateScripts {
     $backup = New-Backup
     if (-not $backup) { Write-Err "Backup не получился, отмена"; return }
 
-    if (-not (Upload-AllFiles)) { Write-Err "Загрузка сорвалась"; return }
+    # Заливаем .sh + awg.conf, НО бинари не трогаем (-SkipBins) и awg.conf шлём лишь если awg
+    # реально установлен: proto берём по фактическим бинарям на роутере (Get-InstalledProto).
+    # Нет детекта (старый/пустой роутер) → 'awg' как было (с -SkipBins лишних бинарей всё равно нет).
+    $instProto = Get-InstalledProto
+    if (-not $instProto) { $instProto = 'awg' }
+    if (-not (Upload-AllFiles -Proto $instProto -SkipBins $true)) { Write-Err "Загрузка сорвалась"; return }
 
     # Дёрнем awg-heal, чтобы он пересобрал состояние с новыми скриптами
     Write-Info "Дёргаю awg-heal.sh чтобы применить новые скрипты..."
@@ -2446,7 +3069,11 @@ function Action-Uninstall {
     $ans = Read-Host "Подтверди (y/N)"
     if ($ans -ne "y" -and $ans -ne "Y") { Write-Warn "Отмена"; return }
 
-    if (-not (PreFlight)) { Write-Err "Pre-flight не прошёл, отмена"; return }
+    # Удаление снимает AWG С РОУТЕРА -- локальный install-payload (awg.conf/.sh/бинари)
+    # для этого НЕ нужен. Гонять полный PreFlight тут нельзя: он валидирует awg.conf и
+    # падает, если запущено из клона репо без секретов (awg.conf в .gitignore). Хватает
+    # связи: plink + роутер доступен + SSH (PreFlight-Remote). pscp проверит сам backup ниже.
+    if (-not (PreFlight-Remote)) { Write-Err "Нет связи с роутером, удаление отменено"; return }
 
     # Сначала backup на всякий
     $backup = New-Backup
@@ -2491,6 +3118,7 @@ echo "UNINSTALL_OK"
             if ("$wipe" -match "WIPE_OK") {
                 Write-Ok "$AWG_DIR удалён полностью. Роутер чист от AWG."
                 $script:AwgState = "FRESH"
+                $script:RouterSummary = $null   # .transport стёрт — не показывать в шапке старый «Протокол · Конфиг»
             } else {
                 Write-Warn "Не удалось удалить ${AWG_DIR}:"; Write-Host ($wipe -join "`n") -ForegroundColor DarkGray
             }
@@ -2715,12 +3343,27 @@ D=/data/usr/app/awg
 echo "TPT $(cat $D/.transport 2>/dev/null || echo awg)"
 echo "ACONF $(cat $D/.active 2>/dev/null)"
 echo "XCONF $(cat $D/.xray-active 2>/dev/null)"
+echo "HCONF $(cat $D/.hy2-active 2>/dev/null)"
+# Живость несущей (LIVE 0|1): шапка не должна врать «Протокол: X», когда туннель не несёт.
+# Дёшево и без egress-пробы: есть ли default в table 1000 И жив ли бэкенд активного
+# транспорта (awg -> свежий handshake awg0; альт -> socks 10808 слушается = QUIC/Reality
+# сессия установлена). Всё локально/мгновенно, лишнего SSH-таймаута не добавляет.
+t=$(cat $D/.transport 2>/dev/null || echo awg)
+live=0
+if ip route show table 1000 2>/dev/null | grep -q '^default'; then
+  case "$t" in
+    awg) hs=$($D/awg show awg0 latest-handshakes 2>/dev/null | awk 'NR==1{print $2}'); case "$hs" in ''|*[!0-9]*) hs=0;; esac; [ "$hs" -gt 0 ] && [ $(( $(date +%s) - hs )) -lt 180 ] && live=1 ;;
+    *)   netstat -ltn 2>/dev/null | grep -q '127.0.0.1:10808' && live=1 ;;
+  esac
+fi
+echo "LIVE $live"
 '@
     $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(($sh -replace "`r`n", "`n")))
     $out = Invoke-Router -Command "echo $b64 | base64 -d | sh" -Silent
     if (-not $out) { return $null }
     $fw = $null; $load = $null; $ram = $null; $disk = $null
-    $tpt = "awg"; $aconf = $null; $xconf = $null
+    $tpt = "awg"; $aconf = $null; $xconf = $null; $hconf = $null
+    $live = -1   # -1 = неизвестно (старый роутер без токена LIVE) -> не утверждаем про несущую
     foreach ($ln in @($out)) {
         $p = (("$ln" -replace "`r", "").Trim()) -split "\s+"
         switch ($p[0]) {
@@ -2728,6 +3371,8 @@ echo "XCONF $(cat $D/.xray-active 2>/dev/null)"
             "TPT"   { if ($p.Count -ge 2 -and $p[1]) { $tpt   = $p[1] } }
             "ACONF" { if ($p.Count -ge 2 -and $p[1]) { $aconf = $p[1] } }
             "XCONF" { if ($p.Count -ge 2 -and $p[1]) { $xconf = $p[1] } }
+            "HCONF" { if ($p.Count -ge 2 -and $p[1]) { $hconf = $p[1] } }
+            "LIVE"  { if ($p.Count -ge 2 -and $p[1] -match '^[01]$') { $live = [int]$p[1] } }
             "LOAD" {
                 if ($p.Count -ge 3) {
                     # load average -> понятный % загрузки ЦП (load/ядра*100). Парсим
@@ -2747,8 +3392,17 @@ echo "XCONF $(cat $D/.xray-active 2>/dev/null)"
     # при смене транспорта/страны/xray-конфига (вызовы Get-RouterSummary после них) —
     # см. Action-SwitchTransport/SwitchCountry/SwitchXrayConfig. CPU/RAM/прошивка
     # остаются снимком за сессию (тянуть на каждом экране = лишний SSH-таймаут).
-    if ($tpt -eq "xray") { $proto = "Протокол: Xray  ·  Конфиг: $(if ($xconf) { $xconf } else { '?' })" }
-    else                 { $proto = "Протокол: AmneziaWG  ·  Конфиг: $(if ($aconf) { $aconf } else { '?' })" }
+    if ($tpt -eq "xray")    { $pname = "Xray";      $cfg = if ($xconf) { $xconf } else { '?' } }
+    elseif ($tpt -eq "hy2") { $pname = "Hysteria2"; $cfg = if ($hconf) { $hconf } else { '?' } }
+    else                    { $pname = "AmneziaWG"; $cfg = if ($aconf) { $aconf } else { '?' } }
+    # Шапка отражает РЕАЛЬНОЕ состояние несущей, а не просто .transport: live=1 — VPN
+    # несёт; live=0 — туннель не поднят (fail-open, трафик напрямую) и это надо кричать,
+    # иначе «Протокол: Hysteria2» вводит в заблуждение, будто VPN включён; live=-1 —
+    # старый роутер без токена, не утверждаем (нейтральная строка как раньше).
+    # Префикс '[!]' ловит Show-Header и красит строку жёлтым.
+    if ($live -eq 0)        { $proto = "[!] VPN НЕ АКТИВЕН — несущая $pname ($cfg) НЕ поднята, трафик идёт НАПРЯМУЮ" }
+    elseif ($live -eq 1)    { $proto = "Протокол: $pname  ·  Конфиг: $cfg  ·  VPN активен" }
+    else                    { $proto = "Протокол: $pname  ·  Конфиг: $cfg" }
     # Две строки ресурсов: 1) прошивка + ЦП, 2) ОЗУ + ПЗУ (в одну строку всё длинно).
     $l1 = @(); if ($fw) { $l1 += "Прошивка $fw" }; if ($load) { $l1 += $load }
     $l2 = @(); if ($ram) { $l2 += $ram };          if ($disk) { $l2 += $disk }
@@ -2764,7 +3418,14 @@ function Show-Header {
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "  BE7000 — AmneziaWG: установка + управление  v$($script:ProjectVersion)" -ForegroundColor Cyan
     Write-Host "  Роутер: $ROUTER_IP" -ForegroundColor Cyan
-    if ($script:RouterSummary) { foreach ($l in @($script:RouterSummary)) { Write-Host "  $l" -ForegroundColor Cyan } }
+    if ($script:RouterSummary) {
+        foreach ($l in @($script:RouterSummary)) {
+            # Строку «VPN НЕ АКТИВЕН» (префикс [!] из Get-RouterSummary) выделяем жёлтым,
+            # чтобы провал несущей бросался в глаза на любом экране, а не сливался с шапкой.
+            $clr = if ("$l" -match '^\[!\]') { 'Yellow' } else { 'Cyan' }
+            Write-Host "  $l" -ForegroundColor $clr
+        }
+    }
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "  Поддержать проект:  https://web.tribute.tg/d/LtA" -ForegroundColor DarkYellow
     Write-Host "============================================================" -ForegroundColor Cyan
@@ -2821,7 +3482,12 @@ if (-not (Find-Pscp)) {
 
 # Установлен ли AWG на роутере? Проба по двум ключевым файлам.
 function Detect-AwgState {
-    $probe = "[ -f $AWG_DIR/switch-vpn.sh ] && [ -f $AWG_DIR/awg.conf ] && echo INSTALLED || echo FRESH"
+    # INSTALLED, если есть switch-vpn.sh И хотя бы один конфиг ЛЮБОГО транспорта:
+    # awg.conf (AmneziaWG) / xray.json|xray-configs/*.json (Xray) / hysteria.yaml|
+    # hy2-configs/*.yaml (Hysteria2). Иначе alt-only установка (hy2/xray без awg)
+    # ошибочно выглядела бы как FRESH. hy2-ветку добавили июнь 2026 — без неё
+    # чисто-Hysteria2 роутер детектился «не установлен» и меню звало переустановку.
+    $probe = "[ -f $AWG_DIR/switch-vpn.sh ] && { [ -f $AWG_DIR/awg.conf ] || [ -s $AWG_DIR/xray.json ] || ls $AWG_DIR/xray-configs/*.json >/dev/null 2>&1 || [ -s $AWG_DIR/hysteria.yaml ] || ls $AWG_DIR/hy2-configs/*.yaml >/dev/null 2>&1; } && echo INSTALLED || echo FRESH"
     $out = "" + (Invoke-Router -Command $probe -Silent)
     if ($out -match "INSTALLED") { return "INSTALLED" }
     if ($out -match "FRESH")     { return "FRESH" }
@@ -2852,10 +3518,23 @@ if (-not $Manage) {
     }
     if ($script:AwgState -eq "FRESH") {
         Write-Warn "AmneziaWG на роутере не найден (или роутер свежий)."
-        if (_Confirm "Запустить установку сейчас?") { Action-Install }
-        else { Write-Info "Ок — установка доступна в меню: «Установка и обслуживание»." }
+        # При дропе файлов не лезем с авто-установкой — юзер пришёл залить конфиги.
+        if (-not $DropFiles -and (_Confirm "Запустить установку сейчас?")) { Action-Install }
+        elseif (-not $DropFiles) { Write-Info "Ок — установка доступна в меню: «Установка и обслуживание»." }
     } elseif ($script:AwgState -eq "INSTALLED") {
         Write-Ok "AmneziaWG установлен — открываю меню управления."
+    }
+}
+
+# Файлы, перетащенные мышью НА be7000.bat (.bat форвардит их в %* -> $DropFiles):
+# мульти-заливка конфигов БЕЗ диалога per-файл. Делаем ДО меню; затем обычный поток
+# продолжится — можно сразу активировать нужный конфиг в меню.
+if ($DropFiles -and @($DropFiles).Count -gt 0) {
+    if ($script:AwgState -eq "UNKNOWN") {
+        Write-Warn "Роутер недоступен — перетащенные конфиги не залить. Проверь связь/пароль и повтори."
+    } else {
+        Action-IngestDroppedConfigs @($DropFiles)
+        if (-not (_Confirm "Открыть меню управления?")) { exit 0 }
     }
 }
 
@@ -2908,13 +3587,17 @@ $cats = @(
             @{ Label = "Удалить конфиг страны (awg)"; Color = "Red"; Do = { Action-DeleteAwgConfig } }
             @{ Label = "Авто-failover при падении VPS (off/sticky/home)"; Color = "Magenta"; Do = { Action-FailoverToggle } }
         ) } }
-    @{ Title = "Протокол: AmneziaWG / Xray"; Mgmt = $true; Sub = {
-        Invoke-Submenu "Протокол: AmneziaWG <-> Xray" @(
-            @{ Label = "Переключить транспорт (awg <-> xray)"; Color = "Magenta"; Do = { Action-SwitchTransport } }
-            @{ Label = "Добавить xray-конфиг (vless:// или JSON)"; Color = "Green"; Do = { Action-AddXrayConfig } }
-            @{ Label = "Выбрать активный xray-конфиг"; Do = { Action-SwitchXrayConfig } }
-            @{ Label = "Правка SNI / fingerprint (RKN бьёт по fp=chrome)"; Color = "Yellow"; Do = { Action-EditXrayReality } }
-            @{ Label = "Удалить xray-конфиг"; Color = "Red"; Do = { Action-DeleteXrayConfig } }
+    @{ Title = "Протокол: AmneziaWG / Xray / Hysteria2"; Mgmt = $true; Sub = {
+        Invoke-Submenu "Протокол: AmneziaWG / Xray / Hysteria2  (альт на флеше один: Xray ЛИБО Hysteria2)" @(
+            @{ Label = "Переключить транспорт (awg / xray / hy2)"; Color = "Magenta"; Do = { Action-SwitchTransport } }
+            @{ Label = "Xray: добавить конфиг (vless:// или JSON)"; Color = "Green"; Do = { Action-AddXrayConfig } }
+            @{ Label = "Xray: выбрать активный конфиг"; Do = { Action-SwitchXrayConfig } }
+            @{ Label = "Xray: правка SNI / fingerprint (RKN бьёт по fp=chrome)"; Color = "Yellow"; Do = { Action-EditXrayReality } }
+            @{ Label = "Xray: удалить конфиг"; Color = "Red"; Do = { Action-DeleteXrayConfig } }
+            @{ Label = "Hysteria2: добавить конфиг (hy2://)"; Color = "Green"; Do = { Action-AddHy2Config } }
+            @{ Label = "Hysteria2: выбрать активный конфиг"; Do = { Action-SwitchHy2Config } }
+            @{ Label = "Hysteria2: правка SNI / insecure"; Color = "Yellow"; Do = { Action-EditHy2 } }
+            @{ Label = "Hysteria2: удалить конфиг"; Color = "Red"; Do = { Action-DeleteHy2Config } }
         ) } }
     @{ Title = "Wi-Fi и подсети (guest / SSID)"; Mgmt = $true; Sub = {
         Invoke-Submenu "Wi-Fi и подсети" @(

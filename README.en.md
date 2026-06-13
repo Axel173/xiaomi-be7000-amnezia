@@ -51,10 +51,11 @@ After installation, your BE7000 will have:
 
 - **Split routing.** The services you pick (by IP/domain lists) go through your server, the rest
   goes directly. No need to push all traffic through a single point.
-- **Two transports to choose from: AmneziaWG and Xray (VLESS/Reality).** A single toggle switches
-  the protocol for the whole home — your shared routing rules (what goes through the VPN) are kept.
-  Handy as a fallback: if AmneziaWG starts getting throttled by DPI, switch to Xray. Xray configs are
-  added by a `vless://` link or ready JSON; SNI and fingerprint can be edited right from the PC.
+- **AmneziaWG plus an alternative transport of your choice: Xray (VLESS/Reality) or Hysteria2 (QUIC).**
+  A single toggle switches the protocol for the whole home — your shared routing rules (what goes
+  through the VPN) are kept. Handy as a fallback: if AmneziaWG starts getting throttled by DPI, switch
+  to the alt. Xray configs are added by a `vless://` link (SNI/fingerprint editable from the PC),
+  Hysteria2 by a `hy2://` link. The flash holds one alt — Xray OR Hysteria2 (you choose at install).
 - **One control panel on your PC.** The `be7000.bat` file opens a menu: turn the VPN on/off, add a
   domain to the tunnel, route a specific device around the VPN, switch countries, check status,
   and so on. No manual commands on the router.
@@ -440,8 +441,9 @@ If it saved you **time and nerves** or was simply useful — here's how to say t
 
 **Getting a VPS for the project? Use a referral link:**
 you need a server anyway (see [What you'll need](#4-what-youll-need)) — if you sign up through a
-link below, the author gets a small bonus, **and the price stays the same for you**.
+link below, the author gets a small bonus, **and the price stays the same for you** (with VDSina — even at a discount).
 - 🖥️ **[MegaHost](https://megahost.kz/?from=16375)** (referral link) — VPS and hosting in Kazakhstan (own data centers, a registrar since 2009)
 - 🖥️ **[JustHost](https://justhost.asia/?ref=232764)** (referral link) — VPS in many locations worldwide (you can pick the server's country)
+- 🖥️ **[VDSina](https://www.vdsina.com/?partner=x8rv7m67wj)** (referral link) — affordable VPS with hourly billing; this link gives **you a 10% discount**. _(No discount but a bigger bonus to the author — [alternative link](https://www.vdsina.com/?partner=7i8wuiy8x5).)_
 
 Thank you!

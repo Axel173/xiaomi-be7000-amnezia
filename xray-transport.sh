@@ -40,8 +40,6 @@ HEV_PID=/tmp/hev.pid
 XRAY_LOG=/tmp/xray.log
 HEV_LOG=/tmp/hev.log
 TRANSPORT_FLAG="$AWG_DIR/.transport"
-SPLIT="$AWG_DIR/split-route.sh"
-AWG_CONF="$AWG_DIR/awg.conf"
 NOTIFY_EVENT="$AWG_DIR/notify-event.sh"
 DNS1=1.1.1.1
 DNS2=8.8.8.8
@@ -50,7 +48,10 @@ FWMARK=0x1
 log() { echo "[xray-transport] $*"; }
 notify_event() { [ -x "$NOTIFY_EVENT" ] && "$NOTIFY_EVENT" "$1" "$2" "$3" "$4" >/dev/null 2>&1; }
 
-proc_alive() { [ -f "$1" ] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
+# ВАЖНО: пустой/0-байтовый пидфайл = НЕ жив. На busybox `kill -0 ""` возвращает 0 (успех) →
+# наивная проверка `kill -0 "$(cat pid)"` дала бы ЛОЖНЫЙ «процесс жив» на пустом пидфайле
+# (бывает при оборванной записи start-stop-daemon -m) → start_daemons НЕ перезапустил бы демон.
+proc_alive() { p=$(cat "$1" 2>/dev/null | tr -d ' \r\n'); [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
 
 # ---- DNS ------------------------------------------------------------------
 # В xray-режиме внутренний Amnezia-DNS (172.29.x dev awg0) ненадёжен (при
@@ -65,29 +66,57 @@ set_xray_dns() {
     done
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || killall -HUP dnsmasq 2>/dev/null
 }
-# Обратно к awg-DNS (зеркало restore_vpn_dns из switch-vpn.sh).
-restore_awg_dns() {
+# Прямой DNS (релинквиш / прямой режим): публичный резолвер БЕЗ маркировки в туннель
+# (туннеля нет → к 1.1.1.1/8.8.8.8 надо идти мимо). Снимаем и OUTPUT-mark, что вешал
+# set_xray_dns. Зеркало DNS-части switch-vpn.sh safety_off, но для xray (нет awg0/awg.conf).
+set_direct_dns() {
     for d in "$DNS1" "$DNS2"; do
         iptables -t mangle -D OUTPUT -d "$d" -j MARK --set-mark $FWMARK 2>/dev/null
     done
-    vpn_dns=$(grep -E '^DNS[[:space:]]*=' "$AWG_CONF" 2>/dev/null | head -1 | awk -F'= *' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
-    [ -z "$vpn_dns" ] && vpn_dns=172.29.172.254
     mkdir -p /etc/dnsmasq.d
-    printf 'no-resolv\nserver=%s\n' "$vpn_dns" > /etc/dnsmasq.d/00-upstream.conf
-    ip route replace "$vpn_dns/32" dev awg0 2>/dev/null
+    printf 'no-resolv\nserver=%s\nserver=%s\n' "$DNS1" "$DNS2" > /etc/dnsmasq.d/00-upstream.conf
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || killall -HUP dnsmasq 2>/dev/null
 }
 
 # ---- демоны ---------------------------------------------------------------
+# Запуск xray в фоне С ЗАХВАТОМ вывода в $XRAY_LOG. ЗАЧЕМ: start-stop-daemon -b при
+# демонизации уводит stdio демона в /dev/null → если xray-конфиг не задаёт лог-файл, причина
+# сбоя (socks не поднялся: кривой сервер/sni/ключи/порт) была НЕВИДНА — tail "$XRAY_LOG" и в
+# start_daemons, и в диагностике установщика выдавал пусто. Обёртка `sh -c 'exec … >>log 2>&1'`
+# переоткрывает stdout/stderr УЖЕ ПОСЛЕ демонизации (внутри sh, до exec) → лог пишется; exec
+# сохраняет PID для pidfile. -x /bin/sh безопасен: дедуп на proc_alive (по пидфайлу), а -K в
+# stop/restart матчит по -p, не по -x.
+spawn_xray() {
+    : > "$XRAY_LOG" 2>/dev/null || true
+    start-stop-daemon -S -b -m -p "$XRAY_PID" -x /bin/sh -- -c "exec '$XRAY' run -c '$XRAY_JSON' >>'$XRAY_LOG' 2>&1"
+}
+
+# Освободить socks-порт, если его держит ЧУЖОЙ процесс. ЗАЧЕМ: xray и hysteria
+# делят ОДИН socks 10808 и общий hev → провайдер socks должен быть РОВНО один.
+# При свопе альта (reinstall xray<->hy2) старый демон остаётся ЖИВ (purge-alt
+# убирает лишь файл-бинарь, не процесс) и держит порт → наш xray не забиндит и
+# молча умрёт ("bind: address already in use"), а netstat увидит ЧУЖОГО слушателя
+# → start_daemons вернул бы ЛОЖНЫЙ успех, hev пошёл бы через старый протокол
+# (egress чужого сервера, не нашего). Поэтому перед стартом бьём чужого держателя.
+free_foreign_socks() {
+    own=$(cat "$XRAY_PID" 2>/dev/null | tr -d ' \r\n')
+    holder=$(netstat -ltnp 2>/dev/null | grep "$SOCKS_ADDR:$SOCKS_PORT " | awk '{print $NF}' | cut -d/ -f1 | head -n1)
+    case "$holder" in ''|*[!0-9]*) return 0 ;; esac   # никто не слушает / pid не распарсился
+    [ "$holder" = "$own" ] && return 0                 # уже наш xray
+    log "socks $SOCKS_PORT держит чужой pid $holder — освобождаю (своп альта/рестарт)"
+    kill "$holder" 2>/dev/null
+    i=0; while [ $i -lt 5 ]; do netstat -ltn 2>/dev/null | grep -q "$SOCKS_ADDR:$SOCKS_PORT" || break; sleep 1; i=$((i+1)); done
+}
 start_daemons() {
     [ -x "$XRAY" ] || { log "НЕТ бинаря $XRAY — установи (be7000.ps1)"; return 1; }
     [ -x "$HEV" ]  || { log "НЕТ бинаря $HEV"; return 1; }
     [ -s "$XRAY_JSON" ] || { log "НЕТ конфига $XRAY_JSON — добавь xray-конфиг (меню)"; return 1; }
     [ -s "$HEV_YAML" ]  || { log "НЕТ $HEV_YAML"; return 1; }
 
+    free_foreign_socks   # выгнать оставшийся hysteria/чужой демон с порта 10808
     if ! proc_alive "$XRAY_PID"; then
         log "запускаю xray…"
-        start-stop-daemon -S -b -m -p "$XRAY_PID" -x "$XRAY" -- run -c "$XRAY_JSON"
+        spawn_xray   # вывод -> $XRAY_LOG
     fi
     i=0
     while [ $i -lt 8 ]; do
@@ -122,7 +151,7 @@ stop_daemons() {
 restart_xray() {
     start-stop-daemon -K -p "$XRAY_PID" 2>/dev/null
     i=0; while [ $i -lt 4 ]; do netstat -ltn 2>/dev/null | grep -q "$SOCKS_ADDR:$SOCKS_PORT" || break; sleep 1; i=$((i+1)); done
-    start-stop-daemon -S -b -m -p "$XRAY_PID" -x "$XRAY" -- run -c "$XRAY_JSON"
+    spawn_xray
     i=0; while [ $i -lt 8 ]; do netstat -ltn 2>/dev/null | grep -q "$SOCKS_ADDR:$SOCKS_PORT" && break; sleep 1; i=$((i+1)); done
     netstat -ltn 2>/dev/null | grep -q "$SOCKS_ADDR:$SOCKS_PORT"
 }
@@ -197,21 +226,19 @@ cmd_up() {
 }
 
 cmd_down() {
-    echo awg > "$TRANSPORT_FLAG"          # ставим первым: heal/watchdog увидят awg
+    # ЧИСТЫЙ РЕЛИНКВИШ (симметрично transport-awg.sh down): отпускаем ТОЛЬКО свою несущую
+    # (xtun) -> fail-open в прямой. НЕ решаем, что поднять следом, и НЕ трогаем .transport —
+    # это забота ОРКЕСТРАТОРА (transport.sh switch <name>). stop_daemons удаляет xtun -> его
+    # default в table $TABLE исчезает с устройством -> fwmark-трафик уходит в main (ПРЯМОЙ).
+    # DNS -> публичный напрямую (туннеля нет). Маркировку (mark-core) НЕ трогаем — общая.
     stop_daemons
     iptables -D FORWARD -o "$TUN" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -i "$TUN" -j ACCEPT 2>/dev/null
-    # Вернуть awg-маршрутизацию: split-route.sh идемпотентно ставит default dev awg0
-    # (+ mark/ip rule/MASQUERADE/маршрут VPN_DNS). awg0 при xray не опускали → он есть.
-    if [ -x "$SPLIT" ]; then
-        "$SPLIT" >/dev/null 2>&1
-    else
-        ip route replace default dev awg0 table "$TABLE" 2>/dev/null
-    fi
-    restore_awg_dns
+    ip route flush table "$TABLE" 2>/dev/null || true
+    set_direct_dns
     rm -f /tmp/awg-watchdog.xstate /tmp/awg-failover-episode 2>/dev/null
     conntrack -F >/dev/null 2>&1 || true
-    log "транспорт = AmneziaWG (default table $TABLE -> awg0)."
+    log "Xray-несущая снята (релинквиш) -> прямой режим (fail-open). Следующий транспорт ставит оркестратор."
 }
 
 cmd_status() {

@@ -208,7 +208,7 @@ done
 ls -l /tmp/*.log 2>/dev/null | awk '{s+=$5}END{if(NR>0)printf "Логи /tmp: %d КБ в %d файлах\n",(s+1023)/1024,NR; else print "Логи /tmp: нет"}'
 
 sec "ЛОГИ /tmp (хвосты по 40 строк)"
-for lg in awg-startup.log switch-vpn-setup.log awg-watchdog.log iplist-update.log notify.log notify-event.log; do
+for lg in awg-startup.log switch-vpn-setup.log awg-watchdog.log iplist-update.log hysteria.log xray.log hev.log notify.log notify-event.log; do
     sub "$lg"
     if [ -f "/tmp/$lg" ]; then tail -40 "/tmp/$lg" 2>/dev/null; else echo "(нет)"; fi
 done
