@@ -232,6 +232,11 @@ country — `configs/germany.conf`, `configs/finland.conf`, etc. Switching is do
 3. Along the way it asks for the **source of the IP-subnet list** (you can leave the default) and
    asks for confirmations. Just follow the on-screen prompts.
 
+> **If your router isn't on `192.168.31.1`.** On the very first run `be7000.bat` asks for the
+> router's IP address (press Enter to keep the default `192.168.31.1`). If your router is on a
+> different subnet (e.g. `192.168.31.100`), enter your address — otherwise the script can't reach
+> it and reports "router unavailable". Change it later: **Access → Change router IP address**.
+
 On the first run it asks for the router's SSH password (the one you set in Step 1). It's stored
 encrypted (Windows DPAPI), so you won't have to enter it again.
 

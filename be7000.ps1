@@ -35,19 +35,24 @@ param(
 )
 
 # Версия PC-стороны проекта. Бампать при заметных изменениях; см. CHANGELOG.md.
-$script:ProjectVersion = '0.3.0'
+$script:ProjectVersion = '0.3.1'
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $script:RouterExitCode = 0   # код выхода последней SSH-команды (ставит Invoke-Router)
 
 # --- Настройки ---
+# $ROUTER_IP/$LAN_SUBNET — ДЕФОЛТЫ. Реальный IP роутера спрашивается при первом запуске
+# (Initialize-RouterHost) и хранится в settings.json; $LAN_SUBNET выводится из него.
+# Не у всех роутер на .1 (бывает .100 и т.п.) — без этого скрипт стучался не туда и писал
+# «роутер недоступен». Меняется потом из меню «Доступ» (Action-SetRouterHost).
 $ROUTER_IP   = "192.168.31.1"
 $ROUTER_USER = "root"
 $LAN_SUBNET  = "192.168.31."
 $AWG_DIR     = "/data/usr/app/awg"
 $CRED_DIR    = Join-Path $env:APPDATA "vpn-toggle"
 $CRED_FILE   = Join-Path $CRED_DIR "cred.dat"
+$SETTINGS_FILE = Join-Path $CRED_DIR "settings.json"   # IP роутера и пр. не-секреты (без DPAPI)
 $SCRIPT_DIR  = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $BACKUP_DIR  = Join-Path $SCRIPT_DIR "backups"
 
@@ -149,6 +154,66 @@ function Get-StoredPassword {
         Write-Warn "Не удалось прочитать сохранённый пароль: $($_.Exception.Message)"
         return $null
     }
+}
+
+# ============================================================
+# IP роутера (настраиваемый; хранится в settings.json рядом с cred.dat)
+# ============================================================
+function Test-IpString([string]$s) {
+    # Грубая, но достаточная валидация IPv4 (4 октета 0..255). Хватает, чтобы не дать
+    # сохранить «192.168» или опечатку с буквами — резолв/SSH потом всё равно проверят связь.
+    if ($s -notmatch '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$') { return $false }
+    foreach ($o in $matches[1..4]) { if ([int]$o -gt 255) { return $false } }
+    return $true
+}
+
+function Get-LanSubnet([string]$ip) {
+    # "192.168.31.100" -> "192.168.31." (префикс /24 для поиска IP ЭТОГО ПК в сети роутера,
+    # см. Get-MyLANIP). Не IPv4 -> $null (вызывающий оставит прежний $LAN_SUBNET).
+    if ($ip -match '^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$') { return "$($matches[1])." }
+    return $null
+}
+
+function Load-RouterHost {
+    # Сохранённый IP роутера из settings.json. Нет файла / битый JSON / не-IPv4 -> $null.
+    if (-not (Test-Path $SETTINGS_FILE)) { return $null }
+    try {
+        $j = Get-Content $SETTINGS_FILE -Raw | ConvertFrom-Json
+        if ($j.RouterIp -and (Test-IpString $j.RouterIp)) { return $j.RouterIp }
+    } catch { }
+    return $null
+}
+
+function Save-RouterHost([string]$ip) {
+    if (-not (Test-Path $CRED_DIR)) { New-Item -ItemType Directory -Path $CRED_DIR -Force | Out-Null }
+    @{ RouterIp = $ip } | ConvertTo-Json | Set-Content -Path $SETTINGS_FILE -Encoding UTF8
+}
+
+function Set-ScriptRouterHost([string]$ip) {
+    # Применяет IP к script-scope: $ROUTER_IP + производный $LAN_SUBNET. Функции читают эти
+    # переменные по имени (script-scope), поэтому одного присваивания тут достаточно.
+    $script:ROUTER_IP = $ip
+    $sub = Get-LanSubnet $ip
+    if ($sub) { $script:LAN_SUBNET = $sub }
+}
+
+function Initialize-RouterHost {
+    # Первый запуск: спросить IP роутера (Enter = дефолт $ROUTER_IP) и запомнить. Дальше
+    # просто применяем сохранённое. Зачем: роутер не всегда на 192.168.31.1 — без этого
+    # скрипт стучался по дефолту и писал «недоступен» (реальная жалоба пользователя).
+    $saved = Load-RouterHost
+    if ($saved) { Set-ScriptRouterHost $saved; return }
+    Write-Section "Первый запуск — адрес роутера"
+    Write-Host "Укажи IP-адрес роутера в локальной сети. Обычно $($script:ROUTER_IP), но у тебя может быть другой"
+    Write-Host "(посмотри в админке роутера или на наклейке; например 192.168.31.100)." -ForegroundColor DarkGray
+    Write-Host "Поменять потом можно в меню: «Доступ» -> «Изменить IP-адрес роутера»." -ForegroundColor DarkGray
+    while ($true) {
+        $ans = (Read-Host "IP роутера [$($script:ROUTER_IP)]").Trim()
+        if (-not $ans) { $ans = $script:ROUTER_IP }   # пустой ввод = дефолт
+        if (Test-IpString $ans) { Set-ScriptRouterHost $ans; Save-RouterHost $ans; break }
+        Write-Warn "Это не похоже на IPv4-адрес (пример: 192.168.31.1). Повтори."
+    }
+    Write-Ok "Адрес роутера сохранён: $($script:ROUTER_IP)"
 }
 
 function Clear-PuttyHostKey {
@@ -1918,6 +1983,28 @@ function Action-ChangePassword {
     if (Save-Password) { Write-Ok "Готово" }
 }
 
+function Action-SetRouterHost {
+    # Сменить IP роутера из меню (например переехал на другую подсеть / роутер не на .1).
+    Write-Section "IP-адрес роутера"
+    Write-Host "Текущий IP роутера: $($script:ROUTER_IP)"
+    Write-Host "Введи новый адрес (Enter — оставить как есть)." -ForegroundColor DarkGray
+    $ans = (Read-Host "Новый IP роутера [$($script:ROUTER_IP)]").Trim()
+    if (-not $ans -or $ans -eq $script:ROUTER_IP) { Write-Info "Без изменений."; return }
+    if (-not (Test-IpString $ans)) { Write-Warn "Не похоже на IPv4-адрес (пример: 192.168.31.1) — отмена."; return }
+    Set-ScriptRouterHost $ans
+    Save-RouterHost $ans
+    Write-Ok "IP роутера: $($script:ROUTER_IP)"
+    # Это другой роутер -> прежний детект/сводка устарели. Пере-проверяем связь и состояние,
+    # чтобы шапка/меню сразу отражали новый адрес (как делает ветка смены пароля).
+    if (Test-RouterReachable) {
+        $script:AwgState = Detect-AwgState
+        if ($script:AwgState -eq "UNKNOWN") { $script:UnknownReason = 'auth' }
+        else { $script:RouterSummary = Get-RouterSummary }
+    } else {
+        $script:AwgState = "UNKNOWN"; $script:UnknownReason = 'offline'
+    }
+}
+
 function Action-RawSSH {
     Write-Section "Произвольная команда на роутере"
     # Короткие awg/vpn/domain в SSH НЕ работают (симлинков нет: / = squashfs ro),
@@ -3480,6 +3567,11 @@ if (-not (Find-Pscp)) {
     Write-Info "Он идёт в том же PuTTY MSI (https://www.putty.org/). Управление по SSH доступно и без него."
 }
 
+# Адрес роутера: при первом запуске спрашиваем и запоминаем, дальше применяем сохранённый.
+# ДО любых обращений к роутеру (Test-RouterReachable/Detect-AwgState/Get-RouterSummary ниже),
+# чтобы они шли на верный IP. Безусловно (в т.ч. под -Manage/-Install).
+Initialize-RouterHost
+
 # Установлен ли AWG на роутере? Проба по двум ключевым файлам.
 function Detect-AwgState {
     # INSTALLED, если есть switch-vpn.sh И хотя бы один конфиг ЛЮБОГО транспорта:
@@ -3626,6 +3718,7 @@ $cats = @(
         ) } }
     @{ Title = "Доступ: SSH-команда / сменить пароль"; Mgmt = $false; Sub = {
         Invoke-Submenu "Доступ к роутеру" @(
+            @{ Label = "Изменить IP-адрес роутера (сейчас: $($script:ROUTER_IP))"; Color = "Magenta"; Do = { Action-SetRouterHost } }
             @{ Label = "Произвольная команда на роутере (raw SSH)"; Do = { Action-RawSSH } }
             @{ Label = "Изменить сохранённый пароль root"; Do = {
                 Action-ChangePassword
