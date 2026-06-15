@@ -1,8 +1,16 @@
-# BE7000 + AmneziaWG — a split-routing VPN gateway
+<div align="center">
+
+![Router](https://img.shields.io/badge/router-Xiaomi_BE7000-orange)
+![Transports](https://img.shields.io/badge/transports-AmneziaWG_%C2%B7_Xray_%C2%B7_Hysteria2-1f6feb)
+[![Telegram](https://img.shields.io/badge/Telegram-news-26A5E4?logo=telegram&logoColor=white)](https://t.me/+tfMLMVKG03FhMGYy)
+
+<img src="assets/banner.svg" alt="BE7000 + AmneziaWG" style="max-width:100%">
+
+### Split-routing VPN gateway for Xiaomi BE7000
 
 🌐 **English** · 🇷🇺 [Русская версия](README.md)
 
-📣 **Project news:** [Telegram channel](https://t.me/+tfMLMVKG03FhMGYy)
+</div>
 
 This project turns a **Xiaomi BE7000 router (Chinese version, stock firmware)** into a flexible
 VPN gateway with **split routing**: traffic to the services you choose (by IP and domain lists)

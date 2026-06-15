@@ -1,8 +1,16 @@
-# BE7000 + AmneziaWG — VPN-шлюз с раздельной маршрутизацией
+<div align="center">
+
+![Роутер](https://img.shields.io/badge/роутер-Xiaomi_BE7000-orange)
+![Транспорты](https://img.shields.io/badge/транспорты-AmneziaWG_%C2%B7_Xray_%C2%B7_Hysteria2-1f6feb)
+[![Telegram](https://img.shields.io/badge/Telegram-новости-26A5E4?logo=telegram&logoColor=white)](https://t.me/+tfMLMVKG03FhMGYy)
+
+<img src="assets/banner.svg" alt="BE7000 + AmneziaWG" style="max-width:100%">
+
+### VPN-шлюз с раздельной маршрутизацией для Xiaomi BE7000
 
 🇷🇺 **Русский** · 🌐 [English version](README.en.md)
 
-📣 **Новости проекта:** [Telegram-канал](https://t.me/+tfMLMVKG03FhMGYy)
+</div>
 
 Этот проект превращает роутер **Xiaomi BE7000 (китайская версия, стоковая прошивка)** в гибкий
 VPN-шлюз с **раздельной маршрутизацией**: трафик к выбранным вами сервисам (по спискам IP и
