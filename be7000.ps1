@@ -35,7 +35,7 @@ param(
 )
 
 # Версия PC-стороны проекта. Бампать при заметных изменениях; см. CHANGELOG.md.
-$script:ProjectVersion = '0.3.2'
+$script:ProjectVersion = '0.3.3'
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -2594,6 +2594,29 @@ function Get-InstalledProto {
     return $null
 }
 
+function Relinquish-ActiveAltForReinstall {
+    # Перед снятием рутовых бинарей альта: если активная несущая — этот альт (xray/hy2), его
+    # РАБОТАЮЩИЙ демон держит старый бинарь как deleted-inode, и rm место НЕ освободит (на
+    # тяжёлом xray/hysteria → No space, прерванная установка). Опускаем несущую ДО rm:
+    # переключением на awg, если он установлен (интернет не прервётся), иначе альт в прямой
+    # режим. Нужную несущую awg-setup поднимет в конце (transport.sh up <proto>), .transport он
+    # перепишет сам. Зеркало _relinquish_if_active в awg-setup-be7000.sh, но для ВЫБРАННОГО/
+    # активного альта — purge-alt релинквишит лишь УБИРАЕМЫЙ, оттого ловушка.
+    param([string[]]$RmRoot)
+    $t = ("" + (Invoke-Router -Command "cat $AWG_DIR/.transport 2>/dev/null" -Silent)).Trim()
+    $altBin = @{ 'xray' = 'xray'; 'hy2' = 'hysteria' }[$t]
+    if (-not $altBin -or ($RmRoot -notcontains $altBin)) { return }  # активная несущая не альт / её бинарь не снимаем
+    $awgOk = ("" + (Invoke-Router -Command "[ -x $AWG_DIR/amneziawg-go ] && [ -f $AWG_DIR/awg.conf -o -f $AWG_DIR/awg0.conf ] && echo READY" -Silent)) -match 'READY'
+    if ($awgOk) {
+        Write-Info "  несущая $t активна и держит свой бинарь — временно перевожу на AmneziaWG, чтобы освободить место (интернет не прервётся)"
+        Invoke-Router -Command "sh $AWG_DIR/transport.sh switch awg 2>&1" -Silent | Out-Null
+    } else {
+        $plug = if ($t -eq 'xray') { 'xray-transport.sh' } else { 'transport-hy2.sh' }
+        Write-Info "  несущая $t активна и держит свой бинарь — временно опускаю её в прямой режим, чтобы освободить место"
+        Invoke-Router -Command "sh $AWG_DIR/$plug down 2>&1" -Silent | Out-Null
+    }
+}
+
 function Upload-AllFiles {
     param([string]$Proto = "awg", [bool]$PurgeOtherAlt = $false, [bool]$SkipBins = $false)
     Write-Section "Заливаю файлы на роутер ($AWG_DIR)"
@@ -2643,13 +2666,17 @@ function Upload-AllFiles {
         if ($Proto -eq 'hy2'  -or $Proto -eq 'bothhy2') { $needBins += @('hysteria.user', 'hev.user') }
         # Перед заливкой ТЯЖЁЛОГО bin/-стейджинга снимаем СТАРЫЕ рабочие копии тех же бинарей
         # в корне $AWG_DIR. ЗАЧЕМ: на реинсталле поверх установленного (напр. awg -> awg+xray)
-        # старый рутовый amneziawg-go (4.85) + новый bin/-стейджинг (amneziawg-go.user 4.85 +
-        # xray.user 7.75 = 13.25) не влезают в пик на 20-МБ /data ещё ДО запуска установщика →
-        # заливка/cp падали «No space». Демоны живут в ПАМЯТИ — снос файла-бинаря их НЕ роняет
-        # (awg0/несущая работают), а установщик переставит бинарь из bin/ (mv). Снимаем только
-        # то, что СЕЙЧАС переустанавливаем (по needBins).
+        # старый рутовый amneziawg-go + новый bin/-стейджинг не влезают в пик на 20-МБ /data
+        # ещё ДО запуска установщика → заливка/cp падали «No space». Снимаем только то, что
+        # СЕЙЧАС переустанавливаем (по needBins). ВАЖНО (грабля, поправлено 2026-06-16): снос
+        # файла НЕ освобождает место, пока его держит ЖИВОЙ демон (deleted-inode). Поэтому если
+        # переустанавливаемый альт сейчас АКТИВНАЯ несущая, его демон держит старый бинарь и rm
+        # места не даст → на тяжёлом xray (~7.9 МБ) /data забивается в 100%, upload падает «No
+        # space», установка рвётся в half-state. Relinquish-ActiveAltForReinstall опускает такую
+        # несущую ДО rm (на awg / в прямой режим); нужную поднимет awg-setup в конце.
         $rmRoot = @($needBins | ForEach-Object { $_ -replace '\.user$', '' })
         if ($rmRoot.Count) {
+            Relinquish-ActiveAltForReinstall -RmRoot $rmRoot
             Write-Info "  освобождаю место: снимаю старые рутовые бинари ($($rmRoot -join ', '))"
             Invoke-Router -Command "cd $AWG_DIR && rm -f $($rmRoot -join ' ')" -Silent | Out-Null
         }
