@@ -49,6 +49,7 @@ HY2_LOG=/tmp/hysteria.log
 HEV_LOG=/tmp/hev.log
 TRANSPORT_FLAG="$AWG_DIR/.transport"
 NOTIFY_EVENT="$AWG_DIR/notify-event.sh"
+APPLY_BYPASS="$AWG_DIR/apply-bypass.sh"
 DNS1=1.1.1.1
 DNS2=8.8.8.8
 FWMARK=0x1
@@ -110,6 +111,25 @@ seed_server_dns() {
     done
     log "локальный DNS: $_host → $_ip (демон резолвит имя сам; конфиг по имени не трогаем)"
     return 0
+}
+
+# ---- анти-петля: endpoint своего VPS мимо маркировки ----------------------
+# IP endpoint'а hy2-сервера: сперва из сида (точный IP, который пойдёт в QUIC-dial),
+# фолбэк — server из конфига, если он сразу IP. Только IPv4 (iplist_set = cidr4).
+hy2_endpoint_ip() {
+    _ip=$(sed -n 's%^address=/[^/]*/%%p' "$SEED_CONF" 2>/dev/null | head -1)
+    [ -n "$_ip" ] && { echo "$_ip"; return 0; }
+    _h=$(grep -E '^[[:space:]]*server:' "$HY2_YAML" 2>/dev/null | head -1 | sed 's/^[[:space:]]*server:[[:space:]]*//; s/[[:space:]]*$//; s/^["'\'']//; s/["'\'']$//')
+    _h=${_h%:*}
+    echo "$_h" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && echo "$_h"
+}
+# Исключить endpoint hy2-сервера из маркировки (иначе свои же пакеты к VPS, если его
+# IP в iplist_set, заворачиваются в xtun = петля). Зовём ДО постановки default->xtun.
+exclude_endpoint() {
+    ep=$(hy2_endpoint_ip)
+    [ -n "$ep" ] || { log "endpoint hy2 не определён — пропуск анти-петли"; return 0; }
+    [ -x "$APPLY_BYPASS" ] && sh "$APPLY_BYPASS" endpoint-set "$ep" >/dev/null 2>&1
+    log "endpoint $ep исключён из маркировки (анти-петля)"
 }
 
 # ---- DNS ------------------------------------------------------------------
@@ -237,6 +257,7 @@ cmd_failover() {
         cp "$f" "$HY2_YAML" && chmod 600 "$HY2_YAML"
         echo "$name" > "$AWG_DIR/.hy2-active"
         if restart_hy2 && cmd_health; then
+            exclude_endpoint        # анти-петля: endpoint нового резерва мимо маркировки
             conntrack -F >/dev/null 2>&1 || true
             ip=$(curl -s --max-time 8 --socks5-hostname "$SOCKS_ADDR:$SOCKS_PORT" https://api.ipify.org 2>/dev/null)
             log "hy2-failover OK: встал на $name (egress ${ip:-?})"
@@ -274,6 +295,7 @@ cmd_up() {
         stop_daemons
         return 1
     fi
+    exclude_endpoint        # анти-петля: endpoint мимо маркировки ДО постановки default->xtun
     apply_hy2_routing
     set_hy2_dns
     echo hy2 > "$TRANSPORT_FLAG"

@@ -40,6 +40,7 @@ ACTIVE_CONF="$AWG_DIR/awg.conf"
 SWITCH="$AWG_DIR/switch-vpn.sh"
 AWG_SETUP="$AWG_DIR/awg_setup.sh"
 NOTIFY_EVENT="$AWG_DIR/notify-event.sh"
+APPLY_BYPASS="$AWG_DIR/apply-bypass.sh"
 HS_MAX=180            # порог возраста handshake (сек) — как в awg-watchdog.sh
 PUB_DNS1=1.1.1.1
 PUB_DNS2=8.8.8.8
@@ -66,6 +67,28 @@ hs_age() {
 }
 
 carrier_up() { ip link show "$IFACE" 2>/dev/null | grep -q 'state UP\|UNKNOWN\|LOWER_UP'; }
+
+# ---- анти-петля: endpoint своего VPS мимо маркировки ----------------------
+# IP endpoint'а awg-сервера. Сначала у демона (awg show — уже резолвленный пир),
+# фолбэк — Endpoint из awg.conf (обычно сразу IP). Только IPv4 (iplist_set = cidr4).
+awg_endpoint_ip() {
+    wg=$(wg_bin)
+    if [ -n "$wg" ]; then
+        ep=$("$wg" show "$IFACE" endpoints 2>/dev/null | awk 'NR==1{print $2}' | sed 's/:[0-9]*$//')
+        echo "$ep" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && { echo "$ep"; return 0; }
+    fi
+    ep=$(grep -E '^Endpoint' "$ACTIVE_CONF" 2>/dev/null | head -1 | awk -F'= *' '{print $2}' | sed 's/:[0-9]*$//; s/[[:space:]]//g')
+    echo "$ep" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && echo "$ep"
+}
+# Исключить endpoint awg-сервера из маркировки (иначе свои же UDP-пакеты к VPS,
+# если его IP в iplist_set, заворачиваются обратно в awg0 = петля). Идемпотентно,
+# переживает ребут (.endpoint-bypass на /data). Зовём ДО постановки default->awg0.
+exclude_endpoint() {
+    ep=$(awg_endpoint_ip)
+    [ -n "$ep" ] || { log "endpoint awg не определён — пропуск анти-петли"; return 0; }
+    [ -x "$APPLY_BYPASS" ] && sh "$APPLY_BYPASS" endpoint-set "$ep" >/dev/null 2>&1
+    log "endpoint $ep исключён из маркировки (анти-петля)"
+}
 
 # ---- DNS ------------------------------------------------------------------
 # awg-режим: dnsmasq форвардит во ВНУТРЕННИЙ Amnezia-DNS (172.29.172.254 dev awg0).
@@ -137,6 +160,7 @@ cmd_up() {
         log "awg0 не поднялся — несущую не активирую"
         return 1
     fi
+    exclude_endpoint        # анти-петля: endpoint мимо маркировки ДО постановки default->awg0
     apply_awg_routing
     restore_vpn_dns
     echo awg > "$TRANSPORT_FLAG"

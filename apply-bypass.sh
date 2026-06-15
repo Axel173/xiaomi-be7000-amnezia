@@ -13,6 +13,15 @@
 #   .bypass-dst      — IP/подсети НАЗНАЧЕНИЯ (сайты/сервисы) мимо VPN (CIDR на строку).
 #                      Правило -d CIDR -j ACCEPT в VPN_EXCLUDE. Надёжно перебивает
 #                      iplist_set/awg_list, т.к. цепочка проверяется ПЕРВОЙ, до меток.
+#   .endpoint-bypass — IP endpoint'а АКТИВНОЙ несущей (VPS-сервер), исключённый
+#                      из маркировки. АВТО, управляет ТОЛЬКО код несущей
+#                      (transport-*.sh up), не пользователь. ЗАЧЕМ: если IP сервера
+#                      попадает в iplist_set (opencck), mangle OUTPUT метит СВОИ ЖЕ
+#                      зашифрованные пакеты к VPS -> ip rule 99 -> table 1000 ->
+#                      default dev awg0/xtun -> пакет к серверу заворачивается ОБРАТНО
+#                      в туннель = бесконечная петля (sent растёт, received~0, DNS
+#                      мёртв). Отдельно от .bypass-dst, чтобы IP сервера не светился
+#                      в пользовательском списке и смена сервера сама снимала старый.
 #   .bypass-ifaces   — Wi-Fi-iface'ы мимо VPN (по строке на iface, напр. wl16).
 #                      Зеркало пункта 25 меню (правило -m physdev --physdev-in IF).
 #   .bypass-guest    — флаг-файл: есть -> гостевая 192.168.33.0/24 идёт мимо VPN
@@ -42,6 +51,8 @@
 #   apply-bypass.sh del-ip   <IP>    — убрать IP устройства из хранилища и снять
 #   apply-bypass.sh add-dst  <CIDR>  — сайт-IP/подсеть назначения мимо VPN (+хранилище)
 #   apply-bypass.sh del-dst  <CIDR>  — вернуть сайт-IP/подсеть в VPN (снять правило)
+#   apply-bypass.sh endpoint-set <IP> — endpoint несущей мимо VPN (авто из transport-*.sh up;
+#                                       пусто = снять). Анти-петля (IP VPS в iplist_set).
 #   apply-bypass.sh add-if   <IFACE> — занести iface и применить правило
 #   apply-bypass.sh del-if   <IFACE> — убрать iface и снять правило
 #   apply-bypass.sh guest-on         — гостевая мимо VPN (флаг + ip rule pref 90)
@@ -61,6 +72,7 @@ STORE_IPS="$AWG_DIR/.bypass-ips"
 STORE_DST="$AWG_DIR/.bypass-dst"
 STORE_IFS="$AWG_DIR/.bypass-ifaces"
 STORE_GUEST="$AWG_DIR/.bypass-guest"
+STORE_EP="$AWG_DIR/.endpoint-bypass"   # IP endpoint'а активной несущей (авто, анти-петля)
 GUEST_SUBNET=192.168.33.0/24
 GUEST_PREF=90
 
@@ -140,6 +152,35 @@ guest_rule_add() {
         ip rule add from "$GUEST_SUBNET" lookup main pref $GUEST_PREF
 }
 guest_rule_del() { ip rule del from "$GUEST_SUBNET" lookup main pref $GUEST_PREF 2>/dev/null; }
+
+# --- endpoint активной несущей мимо VPN (анти-петля, см. шапку про .endpoint-bypass) ---
+# Replace-семантика: храним ОДИН IP (endpoint активной несущей). Зовётся из
+# transport-*.sh up (а switch-vpn делегирует в transport-awg up -> покрыты и смена
+# страны/конфига, и failover, и кросс-смена транспорта). Пустой $1 = снять исключение.
+endpoint_set() {   # $1 = IPv4 endpoint'а (пусто = снять)
+    ensure_chain
+    new="$1"
+    # снять прежний авто-endpoint — КРОМЕ адреса, который юзер сам внёс в .bypass-dst
+    # (там это его осознанный вырез, не наш) и кроме совпадающего с новым.
+    if [ -f "$STORE_EP" ]; then
+        while IFS= read -r old; do
+            [ -z "$old" ] && continue
+            [ "$old" = "$new" ] && continue
+            grep -qxF "$old" "$STORE_DST" 2>/dev/null && continue
+            rule_del_dst "$old"
+        done < "$STORE_EP"
+    fi
+    : > "$STORE_EP"
+    [ -z "$new" ] && { echo "[apply-bypass] endpoint-исключение снято"; return 0; }
+    # строго IPv4 — в VPN_EXCLUDE кладём только числовой адрес (не имя: iptables -d
+    # с именем резолвит ОДИН раз и может уйти в дохлый туннель; имя резолвит несущая).
+    echo "$new" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || {
+        echo "[apply-bypass] endpoint '$new' не IPv4 — пропуск"; return 0; }
+    echo "$new" > "$STORE_EP"
+    rule_add_dst "$new"
+    conntrack -D -d "$new" >/dev/null 2>&1 || true   # сбросить уже зациклившиеся сессии к VPS
+    echo "[apply-bypass] endpoint $new -> мимо VPN (анти-петля)"
+}
 
 # --- VPN_FORCE: «целиком через VPN» (см. шапку про force) -------------------
 # chain VPN_FORCE: создать (если нет) и подцепить ВТОРЫМ в PREROUTING (после
@@ -236,7 +277,14 @@ apply_all() {
         done < "$STORE_IFS"
     fi
     [ -f "$STORE_GUEST" ] && { guest_rule_add; g=on; }
-    echo "[apply-bypass] восстановлено: ip=$n_ip, dst=$n_dst, iface=$n_if, guest=$g"
+    # endpoint активной несущей (анти-петля) — переиграть на boot/repair ДО подъёма
+    # несущей (несущая потом сама обновит через transport-*.sh up endpoint-set).
+    ep=""
+    if [ -s "$STORE_EP" ]; then
+        ep=$(head -1 "$STORE_EP" | tr -d ' \r\n')
+        [ -n "$ep" ] && rule_add_dst "$ep"
+    fi
+    echo "[apply-bypass] восстановлено: ip=$n_ip, dst=$n_dst, iface=$n_if, guest=$g, endpoint=${ep:-нет}"
     # «целиком через VPN» (force) — отдельная цепочка VPN_FORCE
     rebuild_force
 }
@@ -247,6 +295,7 @@ case "$1" in
     del-ip)    [ -z "$2" ] && { echo "нужен IP";    exit 1; }; store_del "$STORE_IPS" "$2"; rule_del_ip "$2"; echo "IP $2 убран из хранилища" ;;
     add-dst)   [ -z "$2" ] && { echo "нужен CIDR";  exit 1; }; ensure_chain; store_add "$STORE_DST" "$2"; rule_add_dst "$2"; echo "dst $2 -> хранилище + мимо VPN" ;;
     del-dst)   [ -z "$2" ] && { echo "нужен CIDR";  exit 1; }; store_del "$STORE_DST" "$2"; rule_del_dst "$2"; echo "dst $2 убран из хранилища" ;;
+    endpoint-set) endpoint_set "$2" ;;   # IP endpoint'а несущей мимо VPN (пусто = снять); зовёт transport-*.sh up
     add-if)    [ -z "$2" ] && { echo "нужен iface"; exit 1; }; ensure_chain; store_add "$STORE_IFS" "$2"; rule_add_if "$2"; echo "iface $2 -> хранилище + применён" ;;
     del-if)    [ -z "$2" ] && { echo "нужен iface"; exit 1; }; store_del "$STORE_IFS" "$2"; rule_del_if "$2"; echo "iface $2 убран из хранилища" ;;
     guest-on)  ensure_chain; touch "$STORE_GUEST"; guest_rule_add; echo "guest 192.168.33.0/24 -> мимо VPN (флаг + ip rule)" ;;
@@ -271,6 +320,8 @@ case "$1" in
         if [ -s "$STORE_IPS" ]; then cat "$STORE_IPS"; else echo "(пусто)"; fi
         echo "== .bypass-dst (сайты-IP/назначение мимо VPN) =="
         if [ -s "$STORE_DST" ]; then cat "$STORE_DST"; else echo "(пусто)"; fi
+        echo "== .endpoint-bypass (endpoint несущей мимо VPN — авто, анти-петля) =="
+        if [ -s "$STORE_EP" ]; then cat "$STORE_EP"; else echo "(пусто)"; fi
         echo "== .bypass-ifaces (SSID/iface мимо VPN) =="
         if [ -s "$STORE_IFS" ]; then cat "$STORE_IFS"; else echo "(пусто)"; fi
         echo "== ЦЕЛИКОМ через VPN (force) =="
@@ -285,7 +336,7 @@ case "$1" in
         else echo "раздельный режим (split)"; fi
         ;;
     *)
-        echo "Использование: $0 {apply|add-ip IP|del-ip IP|add-dst CIDR|del-dst CIDR|add-if IFACE|del-if IFACE|guest-on|guest-off|force-add-ip IP|force-del-ip IP|force-add-if IFACE|force-del-if IFACE|force-guest-on|force-guest-off|full-tunnel on|off|list}"
+        echo "Использование: $0 {apply|add-ip IP|del-ip IP|add-dst CIDR|del-dst CIDR|endpoint-set IP|add-if IFACE|del-if IFACE|guest-on|guest-off|force-add-ip IP|force-del-ip IP|force-add-if IFACE|force-del-if IFACE|force-guest-on|force-guest-off|full-tunnel on|off|list}"
         exit 1
         ;;
 esac

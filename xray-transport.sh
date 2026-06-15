@@ -41,6 +41,8 @@ XRAY_LOG=/tmp/xray.log
 HEV_LOG=/tmp/hev.log
 TRANSPORT_FLAG="$AWG_DIR/.transport"
 NOTIFY_EVENT="$AWG_DIR/notify-event.sh"
+APPLY_BYPASS="$AWG_DIR/apply-bypass.sh"
+SEED_CONF="/etc/dnsmasq.d/02-altserver.conf" # локальный dnsmasq-ответ server-host->IP (демон резолвит имя сам)
 DNS1=1.1.1.1
 DNS2=8.8.8.8
 FWMARK=0x1
@@ -52,6 +54,72 @@ notify_event() { [ -x "$NOTIFY_EVENT" ] && "$NOTIFY_EVENT" "$1" "$2" "$3" "$4" >
 # наивная проверка `kill -0 "$(cat pid)"` дала бы ЛОЖНЫЙ «процесс жив» на пустом пидфайле
 # (бывает при оборванной записи start-stop-daemon -m) → start_daemons НЕ перезапустил бы демон.
 proc_alive() { p=$(cat "$1" 2>/dev/null | tr -d ' \r\n'); [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+
+# ---- резолв сервера по имени (анти-FATAL на старте) — зеркало transport-hy2.sh ----
+# ЗАЧЕМ: xray-конфиг почти всегда задаёт address ПО ИМЕНИ (vless://…@host…). xray
+# резолвит это имя при старте через системный resolver (dnsmasq -> 1.1.1.1, а он в
+# iplist_set -> маркирован в туннель, который ещё НЕ поднят) -> dial fails. Резолвим
+# САМИ против WAN/ISP-резолверов (мимо туннеля), фолбэк — публичные. Печатает IPv4.
+resolve_ipv4() {
+    _h="$1"
+    _rs=$(sed -n 's/^[[:space:]]*nameserver[[:space:]]*//p' /tmp/resolv.conf.auto 2>/dev/null)
+    for _r in $_rs 1.1.1.1 8.8.8.8 9.9.9.9; do
+        _ip=$(nslookup "$_h" "$_r" 2>/dev/null | awk '/^Name:/{f=1;next} f&&/Address/{x=$NF; if(x ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/){print x; exit}}')
+        [ -n "$_ip" ] && { echo "$_ip"; return 0; }
+    done
+    return 1
+}
+# Имя/IP сервера из первого аутбаунда xray.json (vless vnext.address / vmess и т.п.).
+xray_server_host() {
+    sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XRAY_JSON" 2>/dev/null | head -1
+}
+# Кладёт ответ для server-host в ЛОКАЛЬНЫЙ dnsmasq (address=/host/IP) — демон резолвит
+# имя сам, мгновенно локально, не уходя в ещё-не-поднятый туннель. Конфиг НЕ трогаем
+# (имя остаётся; SNI берётся из него же). $SEED_CONF — изолированный файл. Возврат 1 =
+# не зарезолвили -> честно не поднимаемся (иначе xray молча падал бы dial-ом).
+seed_server_dns() {
+    [ -s "$XRAY_JSON" ] || { log "нет $XRAY_JSON"; return 1; }
+    _host=$(xray_server_host)
+    [ -n "$_host" ] || { log "не нашёл address в $XRAY_JSON"; return 1; }
+    if echo "$_host" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        rm -f "$SEED_CONF" 2>/dev/null; return 0       # server уже IP — сеять нечего
+    fi
+    _ip=""; _n=0
+    while [ "$_n" -lt 6 ]; do
+        _ip=$(resolve_ipv4 "$_host"); [ -n "$_ip" ] && break
+        _n=$((_n+1)); log "резолв server-host '$_host' попытка $_n не удалась — повтор через 2с…"; sleep 2
+    done
+    [ -n "$_ip" ] || { log "НЕ зарезолвил server-host '$_host' за 6 попыток → несущая не встанет (честно)"; return 1; }
+    echo "$_ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || { log "резолв вернул не-IP '$_ip' — не сею"; return 1; }
+    mkdir -p /etc/dnsmasq.d
+    printf 'address=/%s/%s\n' "$_host" "$_ip" > "$SEED_CONF"
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || killall -HUP dnsmasq 2>/dev/null
+    _k=0
+    while [ "$_k" -lt 6 ]; do
+        nslookup "$_host" 127.0.0.1 2>/dev/null | awk '/^Name:/{f=1;next} f&&/Address/{print $NF}' | grep -qx "$_ip" && break
+        _k=$((_k+1)); sleep 1
+    done
+    log "локальный DNS: $_host → $_ip (демон резолвит имя сам; конфиг по имени не трогаем)"
+    return 0
+}
+
+# ---- анти-петля: endpoint своего VPS мимо маркировки ----------------------
+# IP endpoint'а xray-сервера: сперва из сида (точный IP, который пойдёт в dial),
+# фолбэк — address из конфига, если он сразу IP. Только IPv4 (iplist_set = cidr4).
+xray_endpoint_ip() {
+    _ip=$(sed -n 's%^address=/[^/]*/%%p' "$SEED_CONF" 2>/dev/null | head -1)
+    [ -n "$_ip" ] && { echo "$_ip"; return 0; }
+    _h=$(xray_server_host)
+    echo "$_h" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && echo "$_h"
+}
+# Исключить endpoint xray-сервера из маркировки (иначе свои же пакеты к VPS, если его
+# IP в iplist_set, заворачиваются в xtun = петля). Зовём ДО постановки default->xtun.
+exclude_endpoint() {
+    ep=$(xray_endpoint_ip)
+    [ -n "$ep" ] || { log "endpoint xray не определён — пропуск анти-петли"; return 0; }
+    [ -x "$APPLY_BYPASS" ] && sh "$APPLY_BYPASS" endpoint-set "$ep" >/dev/null 2>&1
+    log "endpoint $ep исключён из маркировки (анти-петля)"
+}
 
 # ---- DNS ------------------------------------------------------------------
 # В xray-режиме внутренний Amnezia-DNS (172.29.x dev awg0) ненадёжен (при
@@ -88,6 +156,7 @@ set_direct_dns() {
 # stop/restart матчит по -p, не по -x.
 spawn_xray() {
     : > "$XRAY_LOG" 2>/dev/null || true
+    seed_server_dns || return 1            # посеять server-host->IP в локальный dnsmasq; 1 = не зарезолвили
     start-stop-daemon -S -b -m -p "$XRAY_PID" -x /bin/sh -- -c "exec '$XRAY' run -c '$XRAY_JSON' >>'$XRAY_LOG' 2>&1"
 }
 
@@ -116,7 +185,7 @@ start_daemons() {
     free_foreign_socks   # выгнать оставшийся hysteria/чужой демон с порта 10808
     if ! proc_alive "$XRAY_PID"; then
         log "запускаю xray…"
-        spawn_xray   # вывод -> $XRAY_LOG
+        spawn_xray || { log "xray не запущен: не удалось зарезолвить server-host. Лог:"; tail -n 15 "$XRAY_LOG" 2>/dev/null; return 1; }
     fi
     i=0
     while [ $i -lt 8 ]; do
@@ -151,7 +220,7 @@ stop_daemons() {
 restart_xray() {
     start-stop-daemon -K -p "$XRAY_PID" 2>/dev/null
     i=0; while [ $i -lt 4 ]; do netstat -ltn 2>/dev/null | grep -q "$SOCKS_ADDR:$SOCKS_PORT" || break; sleep 1; i=$((i+1)); done
-    spawn_xray
+    spawn_xray || { log "restart_xray: резолв server-host не удался"; return 1; }
     i=0; while [ $i -lt 8 ]; do netstat -ltn 2>/dev/null | grep -q "$SOCKS_ADDR:$SOCKS_PORT" && break; sleep 1; i=$((i+1)); done
     netstat -ltn 2>/dev/null | grep -q "$SOCKS_ADDR:$SOCKS_PORT"
 }
@@ -173,6 +242,7 @@ cmd_failover() {
         cp "$f" "$XRAY_JSON" && chmod 600 "$XRAY_JSON"
         echo "$name" > "$AWG_DIR/.xray-active"
         if restart_xray && cmd_health; then
+            exclude_endpoint        # анти-петля: endpoint нового резерва мимо маркировки
             conntrack -F >/dev/null 2>&1 || true
             ip=$(curl -s --max-time 8 --socks5-hostname "$SOCKS_ADDR:$SOCKS_PORT" https://api.ipify.org 2>/dev/null)
             log "xray-failover OK: встал на $name (egress ${ip:-?})"
@@ -214,6 +284,7 @@ cmd_up() {
         stop_daemons
         return 1
     fi
+    exclude_endpoint        # анти-петля: endpoint мимо маркировки ДО постановки default->xtun
     apply_xray_routing
     set_xray_dns
     echo xray > "$TRANSPORT_FLAG"
@@ -235,6 +306,7 @@ cmd_down() {
     iptables -D FORWARD -o "$TUN" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -i "$TUN" -j ACCEPT 2>/dev/null
     ip route flush table "$TABLE" 2>/dev/null || true
+    rm -f "$SEED_CONF" 2>/dev/null         # снять локальный сид server-host (set_direct_dns ниже рестартит dnsmasq)
     set_direct_dns
     rm -f /tmp/awg-watchdog.xstate /tmp/awg-failover-episode 2>/dev/null
     conntrack -F >/dev/null 2>&1 || true
