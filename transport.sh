@@ -50,12 +50,15 @@ plugin_for() {
 transport_ready() {
     p=$(plugin_for "$1"); [ -n "$p" ] && [ -x "$p" ] || return 1
     case "$1" in
-        # awg — БАЗА, но на hy2/xray-only установке awg-ДЕМОНА (amneziawg-go) НЕТ, а
-        # awg.conf мог появиться позже (залили конфиг страны через меню «Серверы AmneziaWG»).
-        # Требуем И конфиг, И демон — иначе list/switch/next считали awg «готовым» по одному
-        # осиротевшему awg.conf, и switch awg РОНЯЛ рабочую несущую (down hy2 → up awg → нет
-        # бинаря → fail-open без восстановления). Симметрично проверке альтов ниже.
-        awg)  [ -f "$AWG_DIR/awg.conf" ] && [ -x "$AWG_DIR/amneziawg-go" ] ;;
+        # awg — БАЗА, но на hy2/xray-only установке awg-бинарей НЕТ, а awg.conf мог
+        # появиться позже (залили конфиг страны через меню «Серверы AmneziaWG»).
+        # Требуем И конфиг, И ОБА бинаря: amneziawg-go (ДЕМОН несущей awg0) И awg (CLI
+        # amneziawg-tools — им awg_setup.sh делает `awg setconf awg0`, без него awg0 НЕ
+        # встаёт). Раньше проверяли лишь amneziawg-go: при половинной установке (демон
+        # докачался, а awg-CLI пропал/не докачался — реальный кейс из proto-install)
+        # list/switch/next считали awg «готовым», и switch awg РОНЯЛ рабочую несущую
+        # (down xray → up awg → awg0 не встаёт → fail-open без восстановления).
+        awg)  [ -f "$AWG_DIR/awg.conf" ] && [ -x "$AWG_DIR/amneziawg-go" ] && [ -x "$AWG_DIR/awg" ] ;;
         # Для альтов требуем И секрет-конфиг, И бинарь: на тесном /data живёт лишь ОДИН
         # альт (xray ЛИБО hysteria), поэтому next()/list() не должны предлагать транспорт,
         # чей бинарь не установлен, даже если осиротевший конфиг остался лежать на флеше.

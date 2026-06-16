@@ -194,13 +194,13 @@ kill_awg_processes() {
     done
 }
 
-# AmneziaWG реально установлен? Демон amneziawg-go — несущая awg0. На hy2/xray-only
-# установке его НЕТ (awg = опциональная база транспорт-агностичного ядра). Тогда
-# switch_to/do_failover НЕ должны рвать рабочую несущую и звать safety_off ради
-# awg-конфига, который некому поднять: иначе залитый через меню «Серверы AmneziaWG»
-# конфиг ронял работающий hy2/xray в прямой режим без восстановления (orphaned awg.conf
-# + bring_down + bring_up-fail + safety_off).
-awg_installed() { [ -x "$AWG_DIR/amneziawg-go" ]; }
+# AmneziaWG реально установлен? Нужны ОБА бинаря: amneziawg-go (демон несущей awg0) И
+# awg (CLI amneziawg-tools — bring_up/awg_setup.sh делают им `awg setconf awg0`). На
+# hy2/xray-only установке их НЕТ (awg = опциональная база транспорт-агностичного ядра),
+# либо awg стоит наполовину (демон докачался, CLI — нет). Тогда switch_to/do_failover НЕ
+# должны рвать рабочую несущую и звать safety_off ради awg-конфига, который некому поднять
+# (orphaned awg.conf + bring_down + bring_up-fail + safety_off). Симметрично transport_ready awg.
+awg_installed() { [ -x "$AWG_DIR/amneziawg-go" ] && [ -x "$AWG_DIR/awg" ]; }
 
 # Поднять туннель из текущего awg.conf
 bring_up() {
