@@ -7,9 +7,13 @@ if [ ! -f "$config_file" ]; then
     exit 1
 fi
 
-address=$(awk -F' = ' '/^Address/ {print $2}' "$config_file")
-dns=$(awk -F' = ' '/^DNS/ {print $2}' "$config_file")
-dns=$(echo $dns | cut -d',' -f1)
+# Парсим Address/DNS устойчиво к формату конфига: «=» с пробелами ИЛИ без, dual-stack
+# через запятую (берём первый токен = IPv4), хвостовой CR. Старый `-F' = '` требовал
+# РОВНО «Address = X»: на экспорте без пробелов (Address=...) или с IPv6 через запятую он
+# возвращал пусто → `ip a add` ниже падал, и awg0 оставался БЕЗ IPv4 (handshake идёт,
+# данные не ходят, rx≈0). Идиома та же, что для DNS в awg-setup-be7000.sh.
+address=$(grep -E '^[[:space:]]*Address[[:space:]]*=' "$config_file" | head -1 | sed 's/^[^=]*=[[:space:]]*//' | cut -d',' -f1 | tr -d ' \t\r')
+dns=$(grep -E '^[[:space:]]*DNS[[:space:]]*=' "$config_file" | head -1 | sed 's/^[^=]*=[[:space:]]*//' | cut -d',' -f1 | tr -d ' \t\r')
 echo "AmneziaWG client address: $address"
 echo "DNS: $dns"
 
@@ -39,7 +43,11 @@ echo "AmneziaWG binaries exist, setting up awg0 interface"
 # Set up AmneziaWG interface
 /data/usr/app/awg/amneziawg-go awg0
 /data/usr/app/awg/awg setconf awg0 /data/usr/app/awg/awg0.conf
-ip a add $address dev awg0
+if [ -n "$address" ]; then
+    ip a add "$address" dev awg0
+else
+    echo "ERROR: поле Address не найдено в $config_file — awg0 останется БЕЗ IPv4 (туннель не понесёт трафик)." >&2
+fi
 ip l set up awg0
 
 # /data/usr/app/awg/awg - check connection

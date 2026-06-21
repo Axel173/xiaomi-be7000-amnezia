@@ -439,7 +439,10 @@ EOF
     ok "DNS upstream настроен ($DNS_OVERRIDE → $VPN_DNS)"
     # Маршрут к VPN DNS через туннель — иначе dnsmasq до него не достучится
     if ip link show awg0 >/dev/null 2>&1; then
-        ip route replace "$VPN_DNS/32" dev awg0 2>/dev/null
+        # best-effort: на переустановке awg0 может быть DOWN (туннель ещё/уже не несёт) →
+        # `ip route replace … dev awg0` отвечает «Network is down» ненулевым кодом, и под
+        # set -e это роняло весь установщик с code 1 (маршрут к DNS — не критичен). || true.
+        ip route replace "$VPN_DNS/32" dev awg0 2>/dev/null || true
         ok "Маршрут к $VPN_DNS прописан через awg0"
     fi
 fi

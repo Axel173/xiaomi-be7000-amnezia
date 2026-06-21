@@ -1365,8 +1365,8 @@ function Action-SwitchTransport {
 
 function Action-AddXrayConfig {
     Write-Section "Добавить xray-конфиг (vless:// или JSON)"
-    Write-Host "Вставь vless://... одной строкой, либо путь к .json с xray-конфигом." -ForegroundColor DarkGray
-    $raw = Read-Host "vless:// или путь к .json"
+    Write-Host "Вставь ссылку ЦЕЛИКОМ (начиная с vless://) одной строкой, либо путь к .json с xray-конфигом." -ForegroundColor DarkGray
+    $raw = Read-Host "Ссылка vless://... или путь к .json"
     if (-not $raw) { Write-Warn "Отмена"; return }
     $raw = $raw.Trim().Trim('"')
     $json = $null; $defName = "xray"
@@ -2917,8 +2917,8 @@ function Ensure-XrayConfigForInstall {
         return $true
     }
     Write-Section "xray-конфиг (vless://) для установки"
-    Write-Host "Вставь ссылку vless://... от своего VPS (VLESS/Reality)." -ForegroundColor DarkGray
-    $raw = Read-Host "vless://"
+    Write-Host "Вставь ссылку ЦЕЛИКОМ, начиная с vless:// (скопируй у VPS полностью, VLESS/Reality)." -ForegroundColor DarkGray
+    $raw = Read-Host "Ссылка (vless://...)"
     if (-not $raw) { Write-Warn "Пусто"; return $false }
     $raw = $raw.Trim().Trim('"')
     $p = Parse-VlessLink $raw

@@ -207,6 +207,11 @@ You need a single file — `awg.conf` with the keys and the address of your serv
   "your own server" mode: it deploys AmneziaWG on your VPS itself and hands you the config.
 - **A ready-made config** from any source that supports AmneziaWG.
 
+> ⚠️ **When exporting from AmneziaVPN, pick the "native" AmneziaWG / WireGuard format** — a text
+> config with `[Interface]` and `[Peer]` sections, **not the "for the AmneziaVPN app" format**. The
+> router can't read the "for the app" format: the tunnel will even come up and handshake, but with
+> no IP address on the interface no traffic flows (symptom — sites don't open, `received` near zero).
+
 > **Don't have a VPS yet?** You'll need a server in any case. A couple of tested hosts (referral
 > links, same price for you) are at the end, in the [Support the author](#12-support-the-author) section.
 
