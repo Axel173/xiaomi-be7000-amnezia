@@ -96,6 +96,42 @@ load_set_from_files() {
     return 0
 }
 
+# fetch_url URL OUTFILE — скачать с устойчивостью к МЁРТВОМУ туннельному DNS.
+# Штатно curl резолвит через системный dnsmasq. НО на УСТАНОВКЕ (вызов из
+# awg-setup-be7000.sh ДО подъёма несущей) и на boot dnsmasq заперт во внутренний
+# DNS туннеля ('no-resolv; server=<VPN_DNS>'), а туннель ещё НЕ несёт → резолв
+# ЛЮБОГО имени мёртв → curl падает 'download failed', а на fresh-install снимка
+# нет → iplist_set остаётся ПУСТЫМ до ручного «обновить список» / ребута / 5:00
+# (поймано на железе 2026-06-24, лог /tmp/iplist-update.log). Трафик к opencck
+# всё равно идёт ПРЯМО (мимо туннеля, до mark-core), поэтому при сбое штатного
+# пути резолвим хост через ПУБЛИЧНЫЙ DNS (минуя dnsmasq) и тянем по --resolve.
+# Возвращает 0 + непустой OUTFILE при успехе. На суточном кроне (туннель жив)
+# срабатывает шаг 1 — поведение прежнее, фолбэк не трогается.
+fetch_url() {
+    _u="$1"; _o="$2"
+    # 1) штатный путь (туннель уже несёт — обычный суточный апдейт)
+    if curl -s --max-time 120 "$_u" -o "$_o" && [ -s "$_o" ]; then return 0; fi
+    # 2) фолбэк: резолв мимо dnsmasq через публичный DNS, забор по --resolve
+    command -v nslookup >/dev/null 2>&1 || return 1
+    # делитель sed — '|' (его нет в URL), т.к. в классах есть '#'/'/'/'?'
+    _host=$(printf '%s' "$_u" | sed -e 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||' -e 's|[/?#].*$||' -e 's|^[^@]*@||' -e 's|:.*$||')
+    [ -n "$_host" ] || return 1
+    case "$_u" in http://*) _port=80 ;; *) _port=443 ;; esac
+    for _ns in 1.1.1.1 8.8.8.8; do
+        # busybox nslookup: после 'Name:' идут строки 'Address[ N]: <ip>'; берём IPv4-токены
+        # (regex без интервалов {n} — старый busybox-awk их не понимает)
+        _ips=$(nslookup "$_host" "$_ns" 2>/dev/null | awk '/^Name:/{f=1;next} f&&/^Address/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $i}')
+        [ -n "$_ips" ] || continue
+        for _ip in $_ips; do
+            echo "fallback resolve via $_ns: $_host -> $_ip"
+            if curl -s --max-time 120 --resolve "$_host:$_port:$_ip" "$_u" -o "$_o" && [ -s "$_o" ]; then
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
 # Флаг уведомлений
 NOTIFY=0
 [ "$1" = "--notify" ] && NOTIFY=1
@@ -136,7 +172,7 @@ else
     # ----- скачиваем (как раньше); merge доклеит локальный файл поверх -----
     echo "source: $URL"
     DOWNLOAD_OK=0
-    if curl -s --max-time 120 "$URL" -o "$TMP"; then
+    if fetch_url "$URL" "$TMP"; then
         LINES=$(wc -l < "$TMP")
         echo "downloaded: $LINES lines"
         if [ "$LINES" -ge "$IPLIST_MIN_LINES" ]; then
